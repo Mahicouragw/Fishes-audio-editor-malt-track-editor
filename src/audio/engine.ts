@@ -200,6 +200,10 @@ export class PlaybackEngine {
 
   async resume(): Promise<void> {
     if (this.playing) return;
+    if (!this.clips.length) {
+      this.paused = false;
+      return;
+    }
     await this.play(this.clips, this.position, this.duration, this.callbacks);
   }
 
@@ -211,10 +215,13 @@ export class PlaybackEngine {
 
   async seek(seconds: number): Promise<void> {
     const target = clamp(seconds, 0, this.duration);
-    if (this.playing) await this.play(this.clips, target, this.duration, this.callbacks);
-    else {
+    if (this.playing) {
+      await this.play(this.clips, target, this.duration, this.callbacks);
+    } else {
+      // Idle or paused: just move the cursor. Not marked paused so Play
+      // always starts a fresh, correctly scheduled pass.
       this.position = target;
-      this.paused = true;
+      this.paused = false;
       this.callbacks.onPosition?.(target);
     }
   }
@@ -246,4 +253,4 @@ export class PlaybackEngine {
   }
 }
 
-export const playbackEngine = new PlaybackEngine();
+

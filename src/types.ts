@@ -95,6 +95,8 @@ export interface HarmonyLayer {
   name: string;
   sourceTrackId: string;
   targetTrackId: string;
+  /** Clip (on the target track) that holds this layer's real shifted signal. */
+  clipId?: string;
   semitones: number;
   gain: number;
   muted: boolean;
