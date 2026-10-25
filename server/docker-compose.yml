@@ -1,0 +1,15 @@
+services:
+  demucs:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - DEMUCS_MODEL=htdemucs
+      - MAX_UPLOAD_MB=250
+      - CLEANUP_MINUTES=30
+      # For local dev, allow your Pages origin:
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:3000,https://mahicouragw.github.io
+    volumes:
+      - ./jobs:/app/jobs
+    restart: unless-stopped
