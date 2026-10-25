@@ -24,27 +24,39 @@ class FakePanner {
 class FakeSource {
   buffer: AudioBuffer | null = null;
   onended: (() => void) | null = null;
+  started = false;
+  stopped = false;
   connect() {}
   disconnect() {}
-  start(_when: number, _offset: number, _duration: number) {}
-  stop() {}
+  start(_when: number, _offset: number, _duration: number) { this.started = true; }
+  stop() { this.stopped = true; }
 }
 
-function makeContext() {
+function makeContext(options: { suspended?: boolean } = {}) {
   let now = 0;
   const ctx = {
     get currentTime() { return now; },
     set currentTime(v: number) { now = v; },
-    state: 'running' as AudioContextState,
+    state: (options.suspended ? 'suspended' : 'running') as AudioContextState,
     sampleRate: 44100,
     destination: {},
     createGain: () => new FakeGain() as unknown as GainNode,
     createStereoPanner: () => { const panner = new FakePanner(); (ctx as unknown as { panners: FakePanner[] }).panners.push(panner); return panner as unknown as StereoPannerNode; },
     panners: [] as FakePanner[],
     createDynamicsCompressor: () => new FakeCompressor() as unknown as DynamicsCompressorNode,
-    createBufferSource: () => new FakeSource() as unknown as AudioBufferSourceNode,
+    createBufferSource: () => {
+      const source = new FakeSource();
+      (ctx as unknown as { sources: FakeSource[] }).sources.push(source);
+      return source as unknown as AudioBufferSourceNode;
+    },
+    sources: [] as FakeSource[],
     close: async () => { (ctx as unknown as { state: string }).state = 'closed'; },
-    resume: async () => { (ctx as unknown as { state: string }).state = 'running'; },
+    resume: async () => {
+      // Resolves on a later microtask, so a second request can race this one.
+      await Promise.resolve();
+      await Promise.resolve();
+      (ctx as unknown as { state: string }).state = 'running';
+    },
     advance: (dt: number) => { now += dt; },
   };
   return ctx as unknown as AudioContext & { advance: (n: number) => void };
@@ -121,5 +133,73 @@ describe('PlaybackEngine pan', () => {
     engine.stop();
     await engine.dispose();
     vi.useRealTimers();
+  });
+});
+
+describe('PlaybackEngine pause and duplicate protection', () => {
+  it('reports the exact paused position and resumes from it', async () => {
+    vi.useFakeTimers();
+    const ctx = makeContext();
+    const engine = new PlaybackEngine(() => ctx);
+    const positions: number[] = [];
+    const onPosition = (p: number) => positions.push(p);
+    const buffer = { duration: 10 } as AudioBuffer;
+    await engine.play([{ id: 'a', buffer, start: 0, sourceStart: 0, duration: 10, gain: 1 }], 0, 10, { onPosition });
+    ctx.advance(3.25);
+    const paused = engine.pause();
+    // `play` schedules 45 ms ahead, so the audible position is the scheduled
+    // one; what matters is that pausing reports and keeps exactly that value.
+    const expected = engine.getPosition();
+    expect(expected).toBeCloseTo(3.25 - 0.045, 5);
+    expect(paused).toBeCloseTo(expected, 6);
+    // The paused position is pushed to the React state as well, not only
+    // returned to the caller that pressed the button.
+    expect(positions[positions.length - 1]).toBeCloseTo(expected, 6);
+    expect(engine.isPlaying()).toBe(false);
+    expect(engine.isPaused()).toBe(true);
+    await engine.resume();
+    expect(engine.isPlaying()).toBe(true);
+    // Resuming does not jump the playhead back by the scheduling lead.
+    expect(engine.getPosition()).toBeCloseTo(expected, 5);
+    ctx.advance(1);
+    expect(engine.getPosition()).toBeGreaterThan(expected + 0.9);
+    expect(engine.getPosition()).toBeLessThan(expected + 1.01);
+    engine.pause();
+    await engine.dispose();
+    vi.useRealTimers();
+  });
+
+  it('never plays twice when play is pressed repeatedly', async () => {
+    const ctx = makeContext({ suspended: true }) as unknown as AudioContext & { sources: FakeSource[] };
+    const engine = new PlaybackEngine(() => ctx);
+    const buffer = { duration: 5 } as AudioBuffer;
+    const clip = { id: 'a', buffer, start: 0, sourceStart: 0, duration: 5, gain: 1 };
+    // Three presses that overlap while the audio context is waking up.
+    await Promise.all([
+      engine.play([clip], 0, 5, {}),
+      engine.play([clip], 0, 5, {}),
+      engine.play([clip], 0, 5, {}),
+    ]);
+    const live = () => ctx.sources.filter((source) => source.started && !source.stopped);
+    expect(live()).toHaveLength(1);
+    // Pressing Resume twice cannot start a second set either.
+    engine.pause();
+    expect(live()).toHaveLength(0);
+    await Promise.all([engine.resume(), engine.resume()]);
+    expect(live()).toHaveLength(1);
+    expect(engine.isPlaying()).toBe(true);
+    await engine.dispose();
+  });
+
+  it('does not start audio after a stop that raced a pending play', async () => {
+    const ctx = makeContext({ suspended: true }) as unknown as AudioContext & { sources: FakeSource[] };
+    const engine = new PlaybackEngine(() => ctx);
+    const buffer = { duration: 5 } as AudioBuffer;
+    const pending = engine.play([{ id: 'a', buffer, start: 0, sourceStart: 0, duration: 5, gain: 1 }], 0, 5, {});
+    engine.stop();
+    await pending;
+    expect(engine.isPlaying()).toBe(false);
+    expect(ctx.sources.filter((source) => source.started && !source.stopped)).toHaveLength(0);
+    await engine.dispose();
   });
 });

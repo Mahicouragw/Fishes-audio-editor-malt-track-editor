@@ -119,7 +119,7 @@ export function MergePanel({ store }: { store: ProjectStore }) {
       {busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(dsp.progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={dsp.message}>
           <div className="progress-bar" style={{ width: `${dsp.progress * 100}%` }} />
-          <span aria-live="polite">{dsp.message} {Math.round(dsp.progress * 100)}%</span>
+          <span>{dsp.message} {Math.round(dsp.progress * 100)}%</span>
         </div>
       )}
       {error && <div className="error" role="alert">{error}</div>}

@@ -306,7 +306,7 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
         {busy && (
           <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={message}>
             <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
-            <span aria-live="polite">{message} {Math.round(progress * 100)}%</span>
+            <span>{message} {Math.round(progress * 100)}%</span>
           </div>
         )}
         {error && <div className="error" role="alert">{error}</div>}

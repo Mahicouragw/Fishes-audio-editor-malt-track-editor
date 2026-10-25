@@ -153,7 +153,10 @@ export function RecordPanel({ store, position }: { store: ProjectStore; position
       <div className="level-meter" aria-label={`Input level ${Math.round(Math.min(1, level * 4) * 100)} percent`} role="progressbar" aria-valuenow={Math.round(Math.min(1, level * 4) * 100)} aria-valuemin={0} aria-valuemax={100}>
         <div className="level-fill" style={{ width: `${Math.min(100, level * 400)}%` }} />
       </div>
-      <div className="timer" aria-live="polite">{formatTime(elapsed)} {status ? `· ${status}` : ''}</div>
+      {/* The running timer is not a live region: a value that changes every
+          second keeps TalkBack talking and blocks cursor navigation. The
+          recording status is announced once, when it changes. */}
+      <div className="timer" aria-live="off">{formatTime(elapsed)} {status ? `· ${status}` : ''}</div>
       {error && <div className="error" role="alert">{error}</div>}
       <div className="row">
         {!recording ? (

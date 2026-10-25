@@ -238,8 +238,13 @@ describe('synchronization and headroom', () => {
     expect(rawPeak).toBeGreaterThan(0);
     const limited = softLimit(mixed);
     expect(peak(limited)).toBeLessThanOrEqual(1);
-    // The limiter must not silence the mix or distort it into silence.
-    expect(peak(limited)).toBeGreaterThan(rawPeak * 0.5);
+    // Four voices each matched to the lead's loudness genuinely sum above full
+    // scale, so the limiter has to take the peaks down. What it must not do is
+    // crush the body of the mix: the RMS loss has to stay under 3 dB.
+    const rms = (signal: Float32Array) => Math.sqrt(
+      signal.reduce((sum, v) => sum + v * v, 0) / signal.length,
+    );
+    expect(rms(limited.channels[0])).toBeGreaterThan(rms(mixed.channels[0]) * 0.7);
   });
 });
 

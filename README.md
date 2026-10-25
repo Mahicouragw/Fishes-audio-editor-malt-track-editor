@@ -8,8 +8,8 @@ A browser-first, accessible, multitrack audio editor that runs entirely in your 
 
 - **Home:** Upload Audio (WAV, MP3, M4A/AAC, OGG, FLAC where the browser decoder supports them), Upload Video (MP4/WebM) with real audio extraction, Merge Audio, Remove Silence, Multitrack Editor, Record Voice, Karaoke Recording, Open Recent Project.
 - **Multitrack Studio:** Voice 1–4 + unlimited tracks, rename/select/duplicate/delete/mute/solo/volume, numeric start/duration fields (no drag-only editing), zoom, synchronized playback with a single Web Audio clock, undo/redo, autosave to IndexedDB.
-- **Transport:** Play/Pause/Stop/Skip backward/forward (configurable, default 5s)/Seek/Restart with clamping and proper cleanup on close.
-- **Pitch (tempo preserved, formant preserved):** Real spectral pitch shifting per track, -24 to +24 semitones, tested at -12/-3/0/+3/+4/+7/+12. **Formants stay at the singer's frequencies** — the shifter never resamples the dry signal, so it cannot turn a voice into a chipmunk (see `HARMONIZATION.md` for the measured before/after). Zero semitones is bit-exact; duration, sample rate and stereo balance are preserved, and the level is matched frame by frame.
+- **Transport:** Play/Pause/Resume/Stop/Skip backward/forward (configurable, default 5s)/Seek/Restart. Pause stops the audio at the exact sample and keeps the playhead; Resume continues from it. Rapid repeated presses cannot start a second playback, and the harmonization panel has its own Pause/Resume/Stop preview controls next to the Preview button.
+- **Pitch (tempo preserved, formant preserved):** Real spectral pitch shifting per track, -24 to +24 semitones, tested at -12/-3/0/+3/+4/+7/+12. **Formants stay at the singer's frequencies** — the shifter never resamples the dry signal, it measures the singer's envelope *per frame*, restores it after the resample and keeps the natural high-frequency roll-off. The **+7** voice now matches the source's high-frequency balance within 2.4 dB (it was 32 dB too bright with a plain resampler and 18 dB too bright with the old clamped correction). Zero semitones is bit-exact; duration, sample rate and stereo balance are preserved, attack transients are kept, and the level is matched frame by frame. See `HARMONIZATION.md` for the measurements.
 - **Human Voice Processing:** Real ON/OFF toggle. Turning it ON runs the actual separator (local approximate: STFT + REPET-style background estimate + stereo-centre + harmonic-salience mask, or a connected Demucs server), then pitch-shifts **only** the isolated vocal (tempo preserved) and mixes it back with the untouched accompaniment; the original asset is never modified, so A/B comparison is always possible. Turning it OFF uses ordinary whole-track processing. It reports real confidence and the limits of the method — this is never presented as a filter or a checkbox.
 - **Harmonization:** Three editable presets — **A: +0/0 ms/100 %, +4/23 ms/30 %, +7/49 ms/40 %, +0/33 ms/30 %**; **B: +0/0/100 %, +3/23/30 %, +7/19/40 %, +0/5/30 %**; **C: natural double-tracking**, four +0 voices at 0/12/24/36 ms and 100/30/25/20 %.** Every pitch, cent-detune, delay, volume, pan, target track and effect is editable. Applying renders real audio onto tracks created on demand, as one undoable step. The **+0 lead reuses the source audio** (bit-identical) and each +0 *double* is micro-detuned so it cannot comb-filter the lead. Applied voices can be previewed, muted, soloed, panned, delayed, gain-adjusted, re-rendered with reverb/echo, duplicated and removed.
 - **Per-track stereo pan:** L / C / R buttons plus a fine −100…+100 slider with spoken labels, applied with a constant-power law in **both** live playback and the exported file. Resolution order is harmony-layer pan → clip pan → track pan. Mono exports have no stereo field and say so.
@@ -57,11 +57,11 @@ GitHub Pages cannot run Python — deploy the server to Fly.io/Render/Railway/et
 
 ## Accessibility
 
-Dark charcoal studio theme with purple accents, large transport, keyboard/focus order, semantic buttons, `aria-label`/`aria-pressed`/`aria-selected`/`role=switch`, live announcements, 44px targets, reduced-motion support, no focus-stealing waveforms.
+Dark charcoal studio theme with purple accents, large transport, keyboard/focus order, semantic buttons, `aria-label`/`aria-pressed`/`aria-selected`/`role=switch`, event-based live announcements only, 44px targets, reduced-motion support, no focus-stealing waveforms. The running playhead, progress percentages and the record timer are deliberately **not** live regions: a value that changes many times a second keeps a screen reader talking and blocks cursor navigation.
 
 ## Tests
 
-174 tests across 20 files (`npx vitest run`). The harmonization suite runs against an **actual 3:32 (212 s) stereo WAV file written to disk and read back**:
+203 tests across 22 files (`npx vitest run`). The harmonization suite runs against an **actual 3:32 (212 s) stereo WAV file written to disk and read back**:
 
 - Entire Song processes the full 212 s, and the last 10 s really is pitch-shifted (proving the tail is not skipped).
 - Selected-range processing leaves every sample outside the range untouched (bit-identical) or silent for a voice layer, and shifts only inside it.
@@ -70,12 +70,15 @@ Dark charcoal studio theme with purple accents, large transport, keyboard/focus 
 - All three presets load their exact pitch/delay/volume values, each voice can be disabled independently, and the +0 lead never allocates duplicate audio.
 - Preset C's doubles add level instead of comb-filtering the lead.
 - Every listed range is shifted independently and the gaps between them are **digitally silent**, with fades at the boundaries.
-- Formant preservation beats raw transposition (0.56 vs 0.25 envelope correlation at +7), pitch lands within 0.01 %, and level stays in 0.7–1.3×.
+- Formant preservation is measured, not claimed: in Presets A and B every voice (+3/+4/+7) follows the *singer's* formant envelope to within 2.7–3.2 dB, while the "the formants moved with the pitch" hypothesis is off by 9.8–14 dB. A plain resample at +7 adds +9.8 dB above 4 kHz and a 1.50× spectral centroid; the shipping shifter adds +1.3 dB and a 0.91× centroid. Pitch lands within 0.01 %, duration is exact and the level stays in 0.7–1.3×.
 - Pan is real: a hard-left exported track leaks < 1e-9 into the right channel, centre is bit-identical, and the live playback graph uses the matching constant-power compensation.
 - Exported WAV bytes, decoded back, contain the real processed sound (not the original pitch).
 - Save/reopen preserves every harmony voice's interval, gain, mute, solo, offset, scope, effects, pan, ranges, key/scale and its track arrangement.
 - Undo/redo runs in order across pan, key, preset and range edits, coalesces slider drags, and **the history stacks are restored when a saved project is reopened**.
 - An unprocessed lead duplicate really is unprocessed: zero pitch, zero cents, no effects, same asset and timing.
+- The analyser rejects window sidelobes (a steady tone's envelope no longer dives 30 dB between its harmonics, which was what made the +7 voice metallic) and leaves material without formants (fewer than six partials) uncoloured.
+- Pause is exact: pausing returns the sample the sound stopped at, pushes it to the playhead, and resuming continues from it without walking backwards by the scheduling lead; pressing Play/Resume repeatedly leaves exactly one live source.
+- The transport offers Play → Pause → Resume with the right accessible name at each step, and the running clock, progress percentages and record timer are not live regions, so TalkBack's cursor can move while audio plays.
 
 Also covered: decoding/validation, tempo preservation, track sync/selection, range effects, recording helpers, merge/silence, export encoding, accessibility labels, and error/large-file handling.
 

@@ -83,7 +83,7 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
           <span>Fine tuning (cents): {pendingCents > 0 ? `+${pendingCents}` : pendingCents}</span>
           <input type="range" min={-50} max={50} step={1} value={pendingCents} aria-label={`${track.name} fine tuning, ${pendingCents} cents`} disabled={busy} onChange={(e) => setPendingCents(Number(e.target.value))} />
         </label>
-        <div className="row" aria-live="polite">
+        <div className="row">
           <button type="button" className="btn" aria-label={`Preview ${track.name} at ${describeSemis(pendingSemis)}`} disabled={busy} onClick={() => onPreviewPitch(pendingSemis)}>Preview</button>
           <button type="button" className="btn" aria-label={`Preview ${track.name} at original pitch`} disabled={busy} onClick={onPreviewOriginal}>Preview original</button>
           <button type="button" className="btn btn-primary" aria-label={`Apply pitch ${describeSemis(pendingSemis)} to ${track.name}`} disabled={busy || !dirty} onClick={() => onPitch(pendingSemis, pendingCents)}>Apply</button>
@@ -127,7 +127,7 @@ export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onS
       {busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={message}>
           <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
-          <span aria-live="polite">{message} {Math.round(progress * 100)}%</span>
+          <span>{message} {Math.round(progress * 100)}%</span>
         </div>
       )}
       <div className="row">
@@ -355,7 +355,7 @@ export function RangeEffectsPanel({ duration, selection, clipDuration, onSelecti
       {busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={message}>
           <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
-          <span aria-live="polite">{message} {Math.round(progress * 100)}%</span>
+          <span>{message} {Math.round(progress * 100)}%</span>
         </div>
       )}
       <div className="row">

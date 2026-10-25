@@ -75,6 +75,8 @@ interface HarnessOptions {
   ranges?: HarmonyRange[];
   canUndo?: boolean;
   canRedo?: boolean;
+  previewPlaying?: boolean;
+  previewPaused?: boolean;
 }
 
 function setup(options: HarnessOptions = {}) {
@@ -101,6 +103,9 @@ function setup(options: HarnessOptions = {}) {
     onSoloHarmony: vi.fn(),
     onUndo: vi.fn(),
     onRedo: vi.fn(),
+    onPausePreview: vi.fn(),
+    onResumePreview: vi.fn(),
+    onStopPreview: vi.fn(),
   };
   const view = render(
     <HarmonizationPanel
@@ -115,6 +120,8 @@ function setup(options: HarnessOptions = {}) {
       activeGroupId={options.harmonies?.length ? 'harmony:t1' : null}
       canUndo={options.canUndo ?? false}
       canRedo={options.canRedo ?? false}
+      previewPlaying={options.previewPlaying ?? false}
+      previewPaused={options.previewPaused ?? false}
       busy={options.busy ?? false}
       progress={0}
       message=""
@@ -378,5 +385,38 @@ describe('HarmonizationPanel', () => {
     await user.click(screen.getByRole('button', { name: 'Harmony interval Perfect fifth (+7)' }));
     expect(screen.getByRole('spinbutton', { name: 'Harmony voice 2 pitch, plus 7 semitones' })).toBeInTheDocument();
     expect(screen.getByRole('slider', { name: /Harmony voice 1 pan, centre/ })).toBeInTheDocument();
+  });
+});
+
+describe('HarmonizationPanel preview playback', () => {
+  it('shows an accessible Pause while a preview is playing', async () => {
+    const user = userEvent.setup();
+    const { onPausePreview } = setup({ previewPlaying: true });
+    const pause = screen.getByRole('button', { name: 'Pause preview' });
+    expect(pause).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resume preview' })).not.toBeInTheDocument();
+    await user.click(pause);
+    expect(onPausePreview).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('harmony-preview-state')).toHaveTextContent('Preview playing');
+    // Stop is always offered next to Pause.
+    expect(screen.getByRole('button', { name: 'Stop preview' })).toBeInTheDocument();
+  });
+
+  it('becomes Resume while paused and keeps the harmony settings intact', async () => {
+    const user = userEvent.setup();
+    const { onResumePreview } = setup({ previewPaused: true, harmonies: [layer({ muted: false })] });
+    expect(screen.queryByRole('button', { name: 'Pause preview' })).not.toBeInTheDocument();
+    const resume = screen.getByRole('button', { name: 'Resume preview' });
+    await user.click(resume);
+    expect(onResumePreview).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('harmony-preview-state')).toHaveTextContent('Preview paused');
+    // The draft (voice 3's +7 interval) is still there after a pause.
+    expect(valueOf(/Harmony voice 3 pitch/)).toBe('7');
+  });
+
+  it('offers no preview transport when nothing is playing', () => {
+    setup();
+    expect(screen.queryByRole('button', { name: 'Pause preview' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop preview' })).not.toBeInTheDocument();
   });
 });

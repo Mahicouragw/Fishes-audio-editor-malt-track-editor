@@ -69,6 +69,13 @@ export interface HarmonizationPanelProps {
   canRedo: boolean;
   onUndo: () => void;
   onRedo: () => void;
+  /** True while a rendered preview (not the project timeline) is playing. */
+  previewPlaying: boolean;
+  /** True while that preview is paused — the control becomes "Resume preview". */
+  previewPaused: boolean;
+  onPausePreview: () => void;
+  onResumePreview: () => void;
+  onStopPreview: () => void;
   onPreview: (draft: HarmonyDraft) => void;
   onApply: (draft: HarmonyDraft) => void;
   onCancel: () => void;
@@ -95,6 +102,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
     tracks, harmonies, sourceTrackId, onSourceTrackChange, mediaDuration, hasVocalStems, onRunSeparation,
     ranges, onAddRange, onUpdateRange, onRemoveRange, songKey, scale, onKeyChange, onScaleChange,
     activeGroupId, onCompare, onSoloHarmony, busy, progress, message, error, canUndo, canRedo, onUndo, onRedo,
+    previewPlaying, previewPaused, onPausePreview, onResumePreview, onStopPreview,
   } = props;
 
   const [scopeMode, setScopeMode] = useState<'entire-song' | 'range'>('entire-song');
@@ -589,6 +597,20 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
           Run vocal separation
         </button>
       )}
+      {/*
+        Honest wording: formant preservation is not a hidden toggle that only
+        works in one mode. Every rendered voice — +3, +4, +7 alike, with or
+        without Human Voice Mode — goes through the same natural-vocal pitch
+        shifter, and the tests measure each interval's formants. Human Voice
+        Mode only decides *what* is shifted (the isolated vocal stem), never
+        *how* it is shifted.
+      */}
+      <p className="hint">
+        Every voice is pitch-shifted with real formant preservation, whichever
+        interval you pick. Human Voice Mode only chooses the source: the
+        separated vocal stem, so the accompaniment is not transposed — the lead
+        and the accompaniment still play in the mix.
+      </p>
       <label className="field checkbox">
         <input
           type="checkbox"
@@ -605,7 +627,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
       {busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={message}>
           <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
-          <span aria-live="polite">{message} {Math.round(progress * 100)}%</span>
+          <span>{message} {Math.round(progress * 100)}%</span>
         </div>
       )}
 
@@ -617,6 +639,29 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
         <button type="button" className="btn" aria-label="Undo last edit" onClick={onUndo} disabled={!canUndo || busy}>Undo</button>
         <button type="button" className="btn" aria-label="Redo last undone edit" onClick={onRedo} disabled={!canRedo || busy}>Redo</button>
       </div>
+
+      {/*
+        Preview playback lives next to the Preview button so it is reachable
+        without scrolling to the main transport. Pause keeps the playhead and
+        the whole harmony draft untouched; Resume continues from that sample.
+      */}
+      {(previewPlaying || previewPaused) && (
+        <div className="row wrap" role="group" aria-label="Preview playback">
+          <span className="hint" role="status" data-testid="harmony-preview-state">
+            {previewPaused ? 'Preview paused' : 'Preview playing'}
+          </span>
+          {previewPaused ? (
+            <button type="button" className="btn btn-primary" aria-label="Resume preview" onClick={onResumePreview}>
+              Resume
+            </button>
+          ) : (
+            <button type="button" className="btn btn-primary" aria-label="Pause preview" onClick={onPausePreview}>
+              Pause
+            </button>
+          )}
+          <button type="button" className="btn" aria-label="Stop preview" onClick={onStopPreview}>Stop</button>
+        </div>
+      )}
 
       {appliedVoices.length > 0 && (
         <div className="field">

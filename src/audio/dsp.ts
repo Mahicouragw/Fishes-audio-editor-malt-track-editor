@@ -99,7 +99,23 @@ function hann(size: number): Float64Array {
  * phases drift apart, and the overlap-add partially cancels the partial —
  * audible as a dull, level-wobbly voice. With locking, the level is preserved.
  */
-export function timeStretch(data: AudioData, factor: number, onProgress?: ProgressFn): AudioData {
+export interface TimeStretchOptions {
+  /**
+   * Fade the first/last frames in and out (default true). The pitch shifter
+   * turns this off and pads its own input instead, so the attack of a shifted
+   * voice is not softened.
+   */
+  edgeFade?: boolean;
+  /** Force the exact output length in samples (default: derived from `factor`). */
+  exactLength?: number;
+}
+
+export function timeStretch(
+  data: AudioData,
+  factor: number,
+  onProgress?: ProgressFn,
+  options: TimeStretchOptions = {},
+): AudioData {
   if (!Number.isFinite(factor) || factor <= 0) throw new Error('Invalid stretch factor');
   if (Math.abs(factor - 1) < 1e-9) return cloneAudio(data);
   const N = 2048;
@@ -107,7 +123,8 @@ export function timeStretch(data: AudioData, factor: number, onProgress?: Progre
   const synthesisHop = Math.max(32, Math.round(analysisHop * factor));
   const window = hann(N);
   const frames = Math.max(1, Math.floor((data.length - N) / analysisHop) + 1);
-  const outputLength = N + (frames - 1) * synthesisHop;
+  const naturalLength = N + (frames - 1) * synthesisHop;
+  const outputLength = options.exactLength ?? naturalLength;
   const bins = N / 2 + 1;
   const result = data.channels.map(() => new Float32Array(outputLength));
   for (let c = 0; c < data.channels.length; c++) {
@@ -175,11 +192,13 @@ export function timeStretch(data: AudioData, factor: number, onProgress?: Progre
       const divisor = windowSum[i] > 0.05 ? windowSum[i] : 0.05;
       output[i] /= divisor;
     }
-    const edge = Math.min(2048, Math.floor(outputLength / 8));
-    for (let i = 0; i < edge; i++) {
-      const fade = i / edge;
-      output[i] *= fade;
-      output[outputLength - 1 - i] *= fade;
+    if (options.edgeFade !== false) {
+      const edge = Math.min(2048, Math.floor(outputLength / 8));
+      for (let i = 0; i < edge; i++) {
+        const fade = i / edge;
+        output[i] *= fade;
+        output[outputLength - 1 - i] *= fade;
+      }
     }
   }
   return audioData(result, data.sampleRate);

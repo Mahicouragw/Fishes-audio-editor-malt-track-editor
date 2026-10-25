@@ -65,6 +65,9 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const [harmonyMediaDuration, setHarmonyMediaDuration] = useState(0);
   const [harmonyProgress, setHarmonyProgress] = useState({ busy: false, progress: 0, message: '' });
   const [harmonyError, setHarmonyError] = useState('');
+  /** What the engine is playing right now: the project timeline or a preview. */
+  const [playingPreview, setPlayingPreview] = useState<string | null>(null);
+  const lastUiPosition = useRef(0);
   const engineRef = useRef<PlaybackEngine | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const preparedRef = useRef(new Map<string, Prepared>());
@@ -107,6 +110,20 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     })();
     return () => { cancelled = true; };
   }, [harmonySourceAssetId]);
+
+  /**
+   * Push the playhead to React at a readable rate. The engine ticks every
+   * 40 ms; re-rendering the whole studio 25 times a second churns every text
+   * node in the page (including anything a screen reader is looking at), so
+   * the display is throttled while the audio clock itself stays exact.
+   */
+  const reportPosition = useCallback((value: number, force = false) => {
+    positionRef.current = value;
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (!force && now - lastUiPosition.current < 200) return;
+    lastUiPosition.current = now;
+    setPosition(value);
+  }, []);
 
   const getEngine = useCallback(() => {
     if (!engineRef.current) engineRef.current = new PlaybackEngine();
@@ -206,26 +223,26 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       }
       const engine = getEngine();
       await engine.play(clips, from, d, {
-        onPosition: (p) => {
-          positionRef.current = p;
-          setPosition(p);
-        },
+        onPosition: (p) => reportPosition(p),
         onEnded: () => {
           setPlaying(false);
           setPaused(false);
-          positionRef.current = d;
-          setPosition(d);
+          setPlayingPreview(null);
+          reportPosition(d, true);
           store.announce('Playback finished');
         },
       });
       setPlaying(true);
       setPaused(false);
+      setPlayingPreview(null);
+      store.announce(`Playing from ${formatTime(from)}`);
     } catch (e) {
       setError((e as Error).message);
       setPlaying(false);
       setPaused(false);
+      store.announce(`Playback failed: ${(e as Error).message}`);
     }
-  }, [ensurePrepared, getEngine, prep.busy, store]);
+  }, [ensurePrepared, getEngine, prep.busy, reportPosition, store]);
 
   const handlePlay = useCallback(async () => {
     const engine = getEngine();
@@ -233,34 +250,34 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       await engine.resume();
       setPlaying(true);
       setPaused(false);
-      store.announce('Resumed');
+      store.announce(playingPreview ? `Resumed ${playingPreview}` : 'Resumed playback');
       return;
     }
+    // Already running: do not schedule a second pass.
+    if (engine.isPlaying()) return;
     await startPlayback(positionRef.current);
-  }, [getEngine, startPlayback, store]);
+  }, [getEngine, playingPreview, startPlayback, store]);
 
   const handlePause = useCallback(() => {
     const p = getEngine().pause();
-    positionRef.current = p;
-    setPosition(p);
+    reportPosition(p, true);
     setPlaying(false);
     setPaused(true);
     store.announce(`Paused at ${formatTime(p)}`);
-  }, [getEngine, store]);
+  }, [getEngine, reportPosition, store]);
 
   const handleStop = useCallback(() => {
     getEngine().stop();
-    positionRef.current = 0;
-    setPosition(0);
+    reportPosition(0, true);
     setPlaying(false);
     setPaused(false);
+    setPlayingPreview(null);
     store.announce('Stopped');
-  }, [getEngine, store]);
+  }, [getEngine, reportPosition, store]);
 
   const handleSeek = useCallback(async (t: number) => {
     const target = clamp(t, 0, durationRef.current);
-    positionRef.current = target;
-    setPosition(target);
+    reportPosition(target, true);
     const engine = getEngine();
     if (engine.isPlaying() || engine.isPaused()) await engine.seek(target);
   }, [getEngine]);
@@ -273,17 +290,15 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     } else {
       target = clamp(positionRef.current + delta, 0, durationRef.current);
     }
-    positionRef.current = target;
-    setPosition(target);
-  }, [getEngine, store.settings.skipSeconds]);
+    reportPosition(target, true);
+  }, [getEngine, reportPosition, store.settings.skipSeconds]);
 
   const handleRestart = useCallback(async () => {
-    positionRef.current = 0;
-    setPosition(0);
+    reportPosition(0, true);
     const engine = getEngine();
     if (engine.isPlaying() || engine.isPaused()) await engine.seek(0);
     else await startPlayback(0);
-  }, [getEngine, startPlayback]);
+  }, [getEngine, reportPosition, startPlayback]);
 
   /** Play a single rendered buffer (previews never touch the prepared cache). */
   const playPreview = useCallback(async (label: string, data: AudioData) => {
@@ -295,17 +310,25 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         0,
         buffer.duration,
         {
-          onPosition: (p) => { positionRef.current = p; setPosition(p); },
-          onEnded: () => { setPlaying(false); setPaused(false); },
+          onPosition: (p) => reportPosition(p),
+          onEnded: () => {
+            setPlaying(false);
+            setPaused(false);
+            setPlayingPreview(null);
+          },
         },
       );
       setPlaying(true);
       setPaused(false);
-      store.announce(`Preview: ${label}`);
+      setPlayingPreview(label);
+      store.announce(`Playing preview: ${label}`);
     } catch (e) {
       setError((e as Error).message);
+      setPlaying(false);
+      setPaused(false);
+      setPlayingPreview(null);
     }
-  }, [getAudioContext, getEngine, store]);
+  }, [getAudioContext, getEngine, reportPosition, store]);
 
   const findClip = useCallback((clipId: string): { track: Track; clip: Clip } | null => {
     for (const track of project.tracks) {
@@ -553,6 +576,11 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             clipStart: 0,
             effects: voice.effects,
             outside: 'silence',
+            // Every generated track — +3, +4 and +7 alike — uses the natural
+            // vocal path: a real spectral shift that re-imposes the singer's
+            // formants after the resample. Never send 0 here; `0` is only the
+            // A/B reference used by the DSP tests.
+            formantPreserve: 1,
           },
           (p, m) => onProgress?.((i + p) / enabled.length, `${label} — ${m}`),
         );
@@ -756,6 +784,9 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             clipStart: 0,
             effects,
             outside: 'silence',
+            // Re-renders (turning a voice on, changing its interval) must use
+            // the same natural-vocal path as the first render.
+            formantPreserve: 1,
           },
         (p, m) => setHarmonyProgress({ busy: true, progress: p, message: m }),
       );
@@ -903,7 +934,11 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
           <button type="button" className="btn" aria-label="New track" onClick={() => store.addTrack()}>New track</button>
           <button type="button" className="btn" aria-label="Save project" onClick={() => store.save().catch(() => undefined)}>Save project</button>
           <button type="button" className="btn btn-primary" aria-label="Export audio" onClick={() => setShowExport(true)}>Export</button>
-          <span className="hint" aria-live="polite">{formatTime(position)} / {formatTime(duration)}</span>
+          {/* The running clock is deliberately NOT a live region: a value that
+              changes 25 times a second makes TalkBack queue announcements
+              forever, which is what stopped the cursor from moving during
+              playback. The transport's own time field reads on demand. */}
+          <span className="hint" aria-live="off">{formatTime(position)} / {formatTime(duration)}</span>
         </div>
       </header>
 
@@ -917,14 +952,14 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       {prep.busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(prep.progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={prep.message}>
           <div className="progress-bar" style={{ width: `${prep.progress * 100}%` }} />
-          <span aria-live="polite">{prep.message} {Math.round(prep.progress * 100)}%</span>
+          <span>{prep.message} {Math.round(prep.progress * 100)}%</span>
         </div>
       )}
 
       {dsp.busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(dsp.progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={dsp.message}>
           <div className="progress-bar" style={{ width: `${dsp.progress * 100}%` }} />
-          <span aria-live="polite">{dsp.message} {Math.round(dsp.progress * 100)}%</span>
+          <span>{dsp.message} {Math.round(dsp.progress * 100)}%</span>
         </div>
       )}
 
@@ -1044,6 +1079,11 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                 canRedo={store.canRedo}
                 onUndo={store.undo}
                 onRedo={store.redo}
+                previewPlaying={playingPreview !== null && playing}
+                previewPaused={playingPreview !== null && paused}
+                onPausePreview={handlePause}
+                onResumePreview={handlePlay}
+                onStopPreview={handleStop}
                 onPreview={handleHarmonyPreview}
                 onApply={handleHarmonyApply}
                 onCancel={handleHarmonyCancel}
