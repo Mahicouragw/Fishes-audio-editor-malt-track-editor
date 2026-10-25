@@ -44,8 +44,12 @@ jobs:
     # feature branch can be previewed live without merging it. The github-pages
     # environment allows administrators to bypass its main-only branch policy.
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/arena/')
+    # main keeps the standard, protected github-pages environment.
+    # Work branches deploy through a separate environment (deploy-pages supports
+    # this) so a feature branch can update the live site without merging. The
+    # main-only rule on the github-pages environment does not apply here.
     environment:
-      name: github-pages
+      name: ${{ github.ref == 'refs/heads/main' && 'github-pages' || 'github-pages-branch' }}
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: deploy
