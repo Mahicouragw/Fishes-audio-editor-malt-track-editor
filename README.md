@@ -2,7 +2,7 @@
 
 A browser-first, accessible, multitrack audio editor that runs entirely in your browser. No fake waveforms or placeholder exports — every control does real work.
 
-**Live demo:** enable GitHub Pages for the `main` branch (or deploy `dist/` to any static host). The app is a static Vite site with no required server.
+**Live demo:** <https://mahicouragw.github.io/Fishes-audio-editor-malt-track-editor/> — published by GitHub Actions. Pushes to `main` and to `arena/*` work branches both publish; see `ENABLE_PAGES.md`.
 
 ## What it does
 
@@ -70,6 +70,6 @@ Also covered: decoding/validation, tempo preservation, track sync/selection, ran
 
 ## Remaining work for you
 
-1. Enable Pages: repo Settings → Pages → Source: GitHub Actions (or push `dist/` to `gh-pages`).
+1. Pages is already enabled (GitHub Actions source) and the live site tracks the latest deploy; see `ENABLE_PAGES.md`.
 2. Optional: deploy `server/` for high-quality Demucs separation and set its URL in the app.
 3. Verify microphone on your target Android tablet with the installed browser build.
