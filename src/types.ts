@@ -90,6 +90,9 @@ export interface Track {
   vocal: VocalState;
 }
 
+/** Which part of the song a harmony voice covers. */
+export type HarmonyScope = 'entire-song' | 'range';
+
 export interface HarmonyLayer {
   id: string;
   name: string;
@@ -100,7 +103,24 @@ export interface HarmonyLayer {
   semitones: number;
   gain: number;
   muted: boolean;
+  solo: boolean;
   vocalsOnly: boolean;
+  /** Timing offset relative to the source start, in seconds. */
+  offsetSeconds: number;
+  /** Effects baked into this layer's rendered signal (independent per voice). */
+  effects: RangeEffect[];
+  /** Entire song or a selected time range. */
+  scope: HarmonyScope;
+  /** Song-time range when scope is 'range'. */
+  rangeStart?: number;
+  rangeEnd?: number;
+  /**
+   * True for the +0 voice. The original-pitch voice reuses the source track's
+   * own audio, so no duplicated audio is rendered for it.
+   */
+  originalVoice: boolean;
+  /** Groups the layers produced by one harmonization apply, so it can be replaced or undone as a unit. */
+  groupId?: string;
 }
 
 export interface RecordingTake {

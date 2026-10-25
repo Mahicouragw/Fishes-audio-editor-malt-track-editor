@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AudioData } from '../types';
 import {
   defaultAppSettings, defaultExportSettings, defaultVocalState, makeId,
-  type AppSettings, type Clip, type HarmonyLayer, type Project, type RecordingTake, type Track, type VocalState,
+  type AppSettings, type Clip, type HarmonyLayer, type HarmonyScope, type Project, type RangeEffect, type RecordingTake, type Track, type VocalState,
 } from '../types';
 import * as db from '../storage/db';
 import { cacheAudioData, evictAudioData, loadAudioData, storeAudioData, storeBlob } from '../storage/assets';
@@ -34,6 +34,48 @@ function cloneProject(project: Project): Project {
   return JSON.parse(JSON.stringify(project)) as Project;
 }
 
+/**
+ * Fill in fields added after a project was saved, so reopening an older
+ * project never crashes on a missing harmony property.
+ */
+export function normalizeProject(project: Project): Project {
+  const harmonies = (project.harmonies ?? []).map((layer) => ({
+    ...layer,
+    solo: layer.solo ?? false,
+    offsetSeconds: layer.offsetSeconds ?? 0,
+    effects: layer.effects ?? [],
+    scope: layer.scope ?? 'entire-song',
+    vocalsOnly: layer.vocalsOnly ?? false,
+    gain: typeof layer.gain === 'number' ? layer.gain : 1,
+    muted: layer.muted ?? false,
+    // A legacy layer with rendered audio is not the +0 reference voice.
+    originalVoice: layer.originalVoice ?? (layer.semitones === 0 && !layer.clipId),
+  }));
+  const tracks = (project.tracks ?? []).map((track) => ({
+    ...track,
+    clips: (track.clips ?? []).map((clip) => ({
+      ...clip,
+      effects: clip.effects ?? [],
+      gain: typeof clip.gain === 'number' ? clip.gain : 1,
+      fadeIn: clip.fadeIn ?? 0,
+      fadeOut: clip.fadeOut ?? 0,
+      sourceStart: clip.sourceStart ?? 0,
+    })),
+    vocal: { ...defaultVocalState(), ...(track.vocal ?? {}) },
+    pitchSemis: track.pitchSemis ?? 0,
+    pitchFineCents: track.pitchFineCents ?? 0,
+    volume: typeof track.volume === 'number' ? track.volume : 1,
+  }));
+  return {
+    ...project,
+    harmonies,
+    tracks,
+    media: project.media ?? [],
+    recordings: project.recordings ?? [],
+    selection: project.selection ?? null,
+  };
+}
+
 export function makeTrack(name: string): Track {
   return {
     id: makeId('track'),
@@ -61,6 +103,27 @@ export function makeClip(assetId: string, name: string, start: number, duration:
     fadeOut: 0,
     effects: [],
   };
+}
+
+/**
+ * One harmonization voice handed to the store. The audio is already rendered
+ * by the DSP layer; the store only wires it onto a track.
+ */
+export interface HarmonyGroupVoice {
+  name: string;
+  semitones: number;
+  gain: number;
+  muted: boolean;
+  solo: boolean;
+  vocalsOnly: boolean;
+  offsetSeconds: number;
+  effects: RangeEffect[];
+  scope: HarmonyScope;
+  rangeStart?: number;
+  rangeEnd?: number;
+  targetTrackId: string;
+  /** Omitted for the +0 original voice, which reuses the source audio. */
+  clip?: { assetId: string; start: number; duration: number; size: number };
 }
 
 export interface UseProjectOptions {
@@ -168,7 +231,7 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     if (!found) throw new Error('Project not found');
     history.current = [];
     future.current = [];
-    commit(found);
+    commit(normalizeProject(found));
     announce(`Opened ${found.title}`);
   }, [announce, commit]);
 
@@ -453,7 +516,12 @@ export function useProjectStore(options: UseProjectOptions = {}) {
         semitones,
         gain: 0.9,
         muted: false,
+        solo: false,
         vocalsOnly: false,
+        offsetSeconds: 0,
+        effects: [],
+        scope: 'entire-song',
+        originalVoice: false,
       };
       harmonyId = harmony.id;
       p.harmonies.push(harmony);
@@ -463,21 +531,194 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     return harmonyId;
   }, [announce, updateProject]);
 
-  const updateHarmony = useCallback((harmonyId: string, patch: Partial<Pick<HarmonyLayer, 'muted' | 'gain' | 'name'>>) => {
+  /**
+   * Make sure the named tracks exist, creating the missing ones in a single
+   * undoable step. Used to give harmony voices real Voice 2/3/4 targets.
+   */
+  const ensureTracks = useCallback((names: string[]): string[] => {
+    const ids: string[] = [];
+    updateProject((p) => {
+      for (const name of names) {
+        const trimmed = name.trim();
+        if (!trimmed) continue;
+        const existing = p.tracks.find((t) => t.name.toLowerCase() === trimmed.toLowerCase());
+        if (existing) {
+          ids.push(existing.id);
+          continue;
+        }
+        const track = makeTrack(trimmed);
+        p.tracks.push(track);
+        ids.push(track.id);
+      }
+      return p;
+    });
+    return ids;
+  }, [updateProject]);
+
+  /**
+   * Replace one harmonization group with a new set of voices as a single
+   * undoable change. Every voice already carries its rendered audio.
+   */
+  const applyHarmonyGroup = useCallback((
+    groupId: string,
+    sourceTrackId: string,
+    voices: HarmonyGroupVoice[],
+  ) => {
+    updateProject((p) => {
+      const previous = p.harmonies.filter((h) => h.groupId === groupId);
+      for (const layer of previous) {
+        for (const track of p.tracks) track.clips = track.clips.filter((c) => c.id !== layer.clipId);
+      }
+      p.harmonies = p.harmonies.filter((h) => h.groupId !== groupId);
+      for (const voice of voices) {
+        if (!voice.clip) {
+          // The +0 original voice: it reuses the source track's own audio, so
+          // no duplicated audio is stored.
+          p.harmonies.push({
+            id: makeId('harmony'),
+            name: voice.name,
+            sourceTrackId,
+            targetTrackId: voice.targetTrackId,
+            semitones: voice.semitones,
+            gain: voice.gain,
+            muted: voice.muted,
+            solo: voice.solo,
+            vocalsOnly: voice.vocalsOnly,
+            offsetSeconds: voice.offsetSeconds,
+            effects: voice.effects,
+            scope: voice.scope,
+            rangeStart: voice.rangeStart,
+            rangeEnd: voice.rangeEnd,
+            originalVoice: true,
+            groupId,
+          });
+          continue;
+        }
+        const target = p.tracks.find((t) => t.id === voice.targetTrackId);
+        if (!target) continue;
+        const clip = makeClip(voice.clip.assetId, voice.name, voice.clip.start, voice.clip.duration);
+        target.clips.push(clip);
+        p.media.push({
+          assetId: voice.clip.assetId,
+          name: voice.name,
+          mime: 'audio/wav',
+          size: voice.clip.size,
+          kind: 'processed',
+          createdAt: Date.now(),
+        });
+        p.harmonies.push({
+          id: makeId('harmony'),
+          name: voice.name,
+          sourceTrackId,
+          targetTrackId: voice.targetTrackId,
+          clipId: clip.id,
+          semitones: voice.semitones,
+          gain: voice.gain,
+          muted: voice.muted,
+          solo: voice.solo,
+          vocalsOnly: voice.vocalsOnly,
+          offsetSeconds: voice.offsetSeconds,
+          effects: voice.effects,
+          scope: voice.scope,
+          rangeStart: voice.rangeStart,
+          rangeEnd: voice.rangeEnd,
+          originalVoice: false,
+          groupId,
+        });
+      }
+      return p;
+    });
+  }, [updateProject]);
+
+  /** Drop every layer of a harmonization group (the "cancel" path). */
+  const removeHarmonyGroup = useCallback((groupId: string) => {
+    updateProject((p) => {
+      const removed = p.harmonies.filter((h) => h.groupId === groupId);
+      for (const layer of removed) {
+        for (const track of p.tracks) track.clips = track.clips.filter((c) => c.id !== layer.clipId);
+      }
+      p.harmonies = p.harmonies.filter((h) => h.groupId !== groupId);
+      return p;
+    });
+    announce('Harmony voices removed');
+  }, [announce, updateProject]);
+
+  const updateHarmony = useCallback((harmonyId: string, patch: Partial<HarmonyLayer>) => {
     updateProject((p) => {
       const layer = p.harmonies.find((h) => h.id === harmonyId);
       if (layer) Object.assign(layer, patch);
       return p;
-    }, patch.muted === undefined && patch.gain === undefined);
+    }, patch.muted === undefined && patch.gain === undefined && patch.solo === undefined);
+  }, [updateProject]);
+
+  /** Move a harmony layer's clip in time without re-rendering it. */
+  const setHarmonyOffset = useCallback((harmonyId: string, offsetSeconds: number) => {
+    updateProject((p) => {
+      const layer = p.harmonies.find((h) => h.id === harmonyId);
+      if (!layer) return p;
+      layer.offsetSeconds = offsetSeconds;
+      // Harmony clips hold a song-timeline aligned buffer, so their timeline
+      // start is the voice's offset from zero.
+      for (const track of p.tracks) {
+        const clip = track.clips.find((c) => c.id === layer.clipId);
+        if (clip) clip.start = Math.max(0, offsetSeconds);
+      }
+      return p;
+    });
+  }, [updateProject]);
+
+  /** Swap a harmony layer's rendered audio (used when a voice is re-rendered). */
+  const replaceHarmonyClip = useCallback((
+    harmonyId: string,
+    assetId: string,
+    duration: number,
+    size: number,
+    name?: string,
+  ) => {
+    updateProject((p) => {
+      const layer = p.harmonies.find((h) => h.id === harmonyId);
+      if (!layer) return p;
+      let replaced = false;
+      for (const track of p.tracks) {
+        const clip = track.clips.find((c) => c.id === layer.clipId);
+        if (!clip) continue;
+        evictAudioData(clip.assetId);
+        clip.assetId = assetId;
+        clip.duration = duration;
+        if (name) clip.name = name;
+        replaced = true;
+      }
+      if (!replaced) return p;
+      const label = name ?? layer.name;
+      const existing = p.media.find((m) => m.assetId === assetId);
+      if (existing) {
+        existing.size = size;
+        existing.name = label;
+      } else {
+        p.media.push({
+          assetId,
+          name: label,
+          mime: 'audio/wav',
+          size,
+          kind: 'processed',
+          createdAt: Date.now(),
+        });
+      }
+      return p;
+    });
   }, [updateProject]);
 
   const removeHarmony = useCallback((harmonyId: string) => {
     updateProject((p) => {
       const layer = p.harmonies.find((h) => h.id === harmonyId);
       if (!layer) return p;
-      for (const track of p.tracks) track.clips = track.clips.filter((c) => c.id !== layer.clipId);
+      for (const track of p.tracks) {
+        for (const clip of track.clips) {
+          if (clip.id === layer.clipId) evictAudioData(clip.assetId);
+        }
+        track.clips = track.clips.filter((c) => c.id !== layer.clipId);
+      }
       p.harmonies = p.harmonies.filter((h) => h.id !== harmonyId);
-      if (layer.clipId) evictAudioData(layer.clipId);
       return p;
     });
     announce('Harmony layer removed');
@@ -498,7 +739,14 @@ export function useProjectStore(options: UseProjectOptions = {}) {
       const clip = makeClip(asset.id, `${layer.name} (copy)`, sourceClip.start, sourceClip.duration);
       target.clips.push(clip);
       p.media.push({ assetId: asset.id, name: clip.name, mime: asset.mime, size: asset.size, kind: 'processed', createdAt: Date.now() });
-      p.harmonies.push({ ...layer, id: makeId('harmony'), name: `${layer.name} (copy)`, clipId: clip.id });
+      p.harmonies.push({
+        ...layer,
+        id: makeId('harmony'),
+        name: `${layer.name} (copy)`,
+        clipId: clip.id,
+        // A copy is its own group so replacing the preset does not delete it.
+        groupId: `${layer.groupId ?? 'harmony'}:copy:${makeId('copy')}`,
+      });
       return p;
     });
     announce('Harmony layer duplicated');
@@ -606,6 +854,11 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     updateHarmony,
     removeHarmony,
     duplicateHarmony,
+    ensureTracks,
+    applyHarmonyGroup,
+    removeHarmonyGroup,
+    setHarmonyOffset,
+    replaceHarmonyClip,
     importAudioData,
     storeVideoOriginal,
     setSelection,

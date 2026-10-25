@@ -120,6 +120,12 @@ export function VocalPanel({ track, onToggle, onPitch, onPreserve, onVocalVolume
         <span>Vocal pitch: {describeSemis(v.pitchSemis)}</span>
         <input type="range" min={-12} max={12} step={1} value={v.pitchSemis} aria-label={`Vocal pitch, ${describeSemis(v.pitchSemis)}`} disabled={busy} onChange={(e) => onPitch(Number(e.target.value))} />
       </label>
+      {v.enabled && v.status === 'ready' && (
+        <p className="hint">
+          While Human Voice Processing is ON, this vocal pitch is what you hear: it is applied to the separated vocal
+          (tempo preserved) and mixed with the untouched accompaniment. The track pitch above only applies when this is OFF.
+        </p>
+      )}
       <label className="field checkbox">
         <input type="checkbox" checked={v.preserveTempo} aria-label="Preserve tempo when pitch shifting vocals" disabled={busy} onChange={(e) => onPreserve(e.target.checked)} />
         <span>Preserve tempo (phase vocoder; unchecking uses a plain resample that changes speed)</span>
@@ -134,86 +140,6 @@ export function VocalPanel({ track, onToggle, onPitch, onPreserve, onVocalVolume
       </label>
       <button type="button" className="btn" aria-label="Restore original audio for this track" onClick={() => { onToggle(false); onPitch(0); }} disabled={busy}>Restore original audio</button>
       <p className="hint">Local separation is an honest approximation (REPET-style background estimate + stereo-centre + harmonic salience mask). Centred or harmonic instruments can remain in the stem. For studio quality, connect a Demucs server in Settings. This is never presented as an EQ trick.</p>
-    </section>
-  );
-}
-
-const HARMONY_PRESETS = [0, 3, 4, 7, -3, -4, -7];
-
-export function HarmonyPanel({ tracks, harmonies, onCreate, onPreview, onMute, onGain, onRemove, onDuplicate, busy }: {
-  tracks: Track[];
-  harmonies: HarmonyLayer[];
-  onCreate: (sourceId: string, targetId: string, semitones: number, vocalsOnly: boolean) => void;
-  onPreview: (harmonyId: string) => void;
-  onMute: (harmonyId: string, muted: boolean) => void;
-  onGain: (harmonyId: string, gain: number) => void;
-  onRemove: (harmonyId: string) => void;
-  onDuplicate: (harmonyId: string) => void;
-  busy: boolean;
-}) {
-  const [source, setSource] = useState(tracks[0]?.id ?? '');
-  const [target, setTarget] = useState(tracks[1]?.id ?? tracks[0]?.id ?? '');
-  const [semis, setSemis] = useState(7);
-  const [custom, setCustom] = useState('');
-  const [vocalsOnly, setVocalsOnly] = useState(false);
-
-  const trackName = (id: string) => tracks.find((t) => t.id === id)?.name ?? 'Unknown track';
-  const effectiveTarget = target === source ? (tracks.find((t) => t.id !== source)?.id ?? '') : target;
-  const effectiveSemis = Number.isFinite(Number(custom)) && custom.trim() !== '' ? clampInt(Number(custom), -24, 24) : semis;
-
-  return (
-    <section className="panel" aria-label="Harmony generator">
-      <h3 className="panel-title">Harmony Generator</h3>
-      <p className="hint">Each layer is a real pitch-shifted signal (tempo preserved) placed on its own track at the source's start position. Layers are independently previewable, muteable, gain-adjustable, duplicable and removable.</p>
-      <label className="field">
-        <span>Source track</span>
-        <select value={source} aria-label="Harmony source track" onChange={(e) => setSource(e.target.value)}>
-          {tracks.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-        </select>
-      </label>
-      <label className="field">
-        <span>Target track</span>
-        <select value={effectiveTarget} aria-label="Harmony target track" onChange={(e) => setTarget(e.target.value)}>
-          {tracks.filter((t) => t.id !== source).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-        </select>
-      </label>
-      <div className="field">
-        <span>Interval: {effectiveSemis >= 0 ? `+${effectiveSemis}` : effectiveSemis} semitones</span>
-        <div className="row wrap">
-          {HARMONY_PRESETS.map((p) => (
-            <button key={p} type="button" className={`btn btn-xs ${effectiveSemis === p ? 'btn-active' : ''}`} aria-pressed={effectiveSemis === p} aria-label={`Harmony interval ${describeSemis(p)}`} onClick={() => { setSemis(p); setCustom(''); }}>{p >= 0 ? `+${p}` : p}</button>
-          ))}
-          <input type="number" min={-24} max={24} step={1} value={custom} placeholder="Custom" aria-label="Custom harmony semitones" onChange={(e) => setCustom(e.target.value)} />
-        </div>
-      </div>
-      <label className="field checkbox">
-        <input type="checkbox" checked={vocalsOnly} aria-label="Apply harmonization only to isolated human vocals" onChange={(e) => setVocalsOnly(e.target.checked)} />
-        <span>Apply only to isolated vocals (requires separation on the source track)</span>
-      </label>
-      <button type="button" className="btn btn-primary" aria-label={`Create harmony ${describeSemis(effectiveSemis)} from ${trackName(source)} to ${trackName(effectiveTarget)}`} disabled={busy || !source || !effectiveTarget || !effectiveTarget} onClick={() => onCreate(source, effectiveTarget, effectiveSemis, vocalsOnly)}>Create harmony layer</button>
-
-      {harmonies.length > 0 && (
-        <ul className="region-list" aria-label="Harmony layers">
-          {harmonies.map((h) => (
-            <li key={h.id} className="merge-item">
-              <span>
-                {h.name} · {trackName(h.sourceTrackId)} → {trackName(h.targetTrackId)}
-                <span className="hint" style={{ display: 'block' }}>{describeSemis(h.semitones)}{h.vocalsOnly ? ' · vocals only' : ''}</span>
-              </span>
-              <span className="row">
-                <button type="button" className="btn btn-xs" aria-label={`Preview harmony ${h.name}`} onClick={() => onPreview(h.id)} disabled={busy}>Preview</button>
-                <button type="button" className={`btn btn-xs ${h.muted ? 'btn-active' : ''}`} aria-pressed={h.muted} aria-label={`${h.muted ? 'Unmute' : 'Mute'} harmony ${h.name}`} onClick={() => onMute(h.id, !h.muted)} disabled={busy}>{h.muted ? 'Unmute' : 'Mute'}</button>
-                <label className="clip-field" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                  <span>Gain</span>
-                  <input type="range" min={0} max={2} step={0.05} value={h.gain} aria-label={`Harmony ${h.name} gain, ${Math.round(h.gain * 100)} percent`} onChange={(e) => onGain(h.id, Number(e.target.value))} style={{ width: 80 }} />
-                </label>
-                <button type="button" className="btn btn-xs" aria-label={`Duplicate harmony ${h.name}`} onClick={() => { void onDuplicate(h.id); }} disabled={busy}>Duplicate</button>
-                <button type="button" className="btn btn-xs btn-danger" aria-label={`Remove harmony ${h.name}`} onClick={() => onRemove(h.id)} disabled={busy}>Remove</button>
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
     </section>
   );
 }

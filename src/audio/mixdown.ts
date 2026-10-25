@@ -1,4 +1,4 @@
-import type { AudioData, Clip, Track } from '../types';
+import type { AudioData, Clip, HarmonyLayer, Track } from '../types';
 import { cloneAudio, applyFades, resampleAudio, audioData, type ProgressFn } from './dsp';
 import { runDspJob } from './dspRunner';
 import { loadAudioData } from '../storage/assets';
@@ -7,10 +7,34 @@ export function effectivePitchSemis(track: Track): number {
   return track.pitchSemis + track.pitchFineCents / 100;
 }
 
-export function harmonyClipFactor(track: Track, clip: Clip, harmonies: { clipId?: string; muted?: boolean; gain?: number }[]): number {
+/** True when at least one harmony voice is soloed. */
+export function hasHarmonySolo(harmonies: HarmonyLayer[]): boolean {
+  return harmonies.some((h) => h.solo);
+}
+
+/**
+ * Gain applied to a clip that carries a harmony voice.
+ * A muted voice is silent; when any voice is soloed, the others fall silent.
+ */
+export function harmonyClipFactor(track: Track, clip: Clip, harmonies: HarmonyLayer[]): number {
   const layer = harmonies.find((h) => h.clipId === clip.id);
   if (!layer) return 1;
-  return layer.muted ? 0 : (layer.gain ?? 1);
+  if (layer.muted) return 0;
+  if (hasHarmonySolo(harmonies) && !layer.solo) return 0;
+  return layer.gain ?? 1;
+}
+
+/**
+ * Gain applied to the source track's own audio when the +0 (original pitch)
+ * voice is part of a harmonization. The original voice reuses the source
+ * track's audio instead of storing a duplicate.
+ */
+export function originalVoiceFactor(track: Track, harmonies: HarmonyLayer[]): number {
+  const layer = harmonies.find((h) => h.originalVoice && h.sourceTrackId === track.id);
+  if (!layer) return 1;
+  if (layer.muted) return 0;
+  if (hasHarmonySolo(harmonies) && !layer.solo) return 0;
+  return layer.gain ?? 1;
 }
 
 export interface PrepareClipOptions {

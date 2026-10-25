@@ -91,6 +91,12 @@ function hann(size: number): Float64Array {
 /**
  * Phase-vocoder time stretch. Magnitudes are preserved while phase advances are
  * recalculated from instantaneous frequencies, so formants/pitch survive the stretch.
+ *
+ * Identity phase locking (Laroche & Dolson) propagates each spectral peak's
+ * phase rotation to the bins around it. Without it, an amplitude-modulated
+ * partial (a sung syllable, for example) splits across neighbouring bins whose
+ * phases drift apart, and the overlap-add partially cancels the partial —
+ * audible as a dull, level-wobbly voice. With locking, the level is preserved.
  */
 export function timeStretch(data: AudioData, factor: number, onProgress?: ProgressFn): AudioData {
   if (!Number.isFinite(factor) || factor <= 0) throw new Error('Invalid stretch factor');
@@ -109,6 +115,7 @@ export function timeStretch(data: AudioData, factor: number, onProgress?: Progre
     const windowSum = new Float32Array(outputLength);
     const previousPhase = new Float64Array(bins);
     const synthesisPhase = new Float64Array(bins);
+    const magnitudes = new Float64Array(bins);
     const re = new Float64Array(N);
     const im = new Float64Array(N);
     for (let frame = 0; frame < frames; frame++) {
@@ -127,8 +134,22 @@ export function timeStretch(data: AudioData, factor: number, onProgress?: Progre
         const trueOmega = frame === 0 ? omega : omega + delta / analysisHop;
         synthesisPhase[k] = frame === 0 ? phase : synthesisPhase[k] + trueOmega * synthesisHop;
         previousPhase[k] = phase;
-        re[k] = magnitude * Math.cos(synthesisPhase[k]);
-        im[k] = magnitude * Math.sin(synthesisPhase[k]);
+        magnitudes[k] = magnitude;
+      }
+      // Identity phase locking: keep every peak's neighbours locked to it.
+      for (let k = 2; k < bins - 2; k++) {
+        if (magnitudes[k] > magnitudes[k - 1] && magnitudes[k] >= magnitudes[k + 1]) {
+          const rotation = synthesisPhase[k] - previousPhase[k];
+          const from = Math.max(1, k - 2);
+          const to = Math.min(bins - 2, k + 2);
+          for (let j = from; j <= to; j++) {
+            if (j !== k) synthesisPhase[j] = previousPhase[j] + rotation;
+          }
+        }
+      }
+      for (let k = 0; k < bins; k++) {
+        re[k] = magnitudes[k] * Math.cos(synthesisPhase[k]);
+        im[k] = magnitudes[k] * Math.sin(synthesisPhase[k]);
         if (k > 0 && k < N / 2) {
           re[N - k] = re[k];
           im[N - k] = -im[k];
@@ -146,7 +167,18 @@ export function timeStretch(data: AudioData, factor: number, onProgress?: Progre
       if (onProgress && c === 0 && frame % 16 === 0) onProgress(frame / frames, 'Time stretching');
     }
     for (let i = 0; i < outputLength; i++) {
-      output[i] = windowSum[i] > 1e-8 ? output[i] / windowSum[i] : 0;
+      // The overlap-add sum collapses towards the very edges of the buffer,
+      // where only the first or last frame contributes. Dividing by that tiny
+      // sum amplifies the window's own residue into a loud spike, so the
+      // divisor is floored and the edge fades out instead.
+      const divisor = windowSum[i] > 0.05 ? windowSum[i] : 0.05;
+      output[i] /= divisor;
+    }
+    const edge = Math.min(2048, Math.floor(outputLength / 8));
+    for (let i = 0; i < edge; i++) {
+      const fade = i / edge;
+      output[i] *= fade;
+      output[outputLength - 1 - i] *= fade;
     }
   }
   return audioData(result, data.sampleRate);

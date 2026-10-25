@@ -88,7 +88,22 @@ function reconstruct(mask: Float32Array, stft: STFTResult, channel: number, onPr
   return output;
 }
 
-function medianSample(values: Float32Array, frames: number, bins: number, bin: number): number {
+/**
+ * Low percentile of a bin's magnitude over time.
+ *
+ * A plain median is a poor background estimate for singing: a sustained voice
+ * is present in most frames, so its median is as high as its peak and the
+ * voice looks like "repeating background". A low percentile instead tracks the
+ * quiet floor, so a steady instrument stays background while a sustained voice
+ * reads as foreground.
+ */
+function percentileSample(
+  values: Float32Array,
+  frames: number,
+  bins: number,
+  bin: number,
+  percentile = 0.2,
+): number {
   const count = Math.min(frames, 64);
   const samples: number[] = [];
   for (let i = 0; i < count; i++) {
@@ -96,7 +111,8 @@ function medianSample(values: Float32Array, frames: number, bins: number, bin: n
     samples.push(values[frame * bins + bin]);
   }
   samples.sort((a, b) => a - b);
-  return samples[Math.floor(samples.length / 2)] ?? 0;
+  const index = Math.min(samples.length - 1, Math.max(0, Math.floor(samples.length * percentile)));
+  return samples[index] ?? 0;
 }
 
 /**
@@ -123,7 +139,7 @@ export function separateVocalsLocal(input: AudioData, onProgress?: ProgressFn): 
   let maskSum = 0;
   let maskSquared = 0;
   const background = new Float32Array(bins);
-  for (let k = 0; k < bins; k++) background[k] = medianSample(magnitudes[0], frames, bins, k);
+  for (let k = 0; k < bins; k++) background[k] = percentileSample(magnitudes[0], frames, bins, k, 0.15);
   for (let frame = 0; frame < frames; frame++) {
     for (let k = 0; k < bins; k++) {
       const index = frame * bins + k;
@@ -141,11 +157,11 @@ export function separateVocalsLocal(input: AudioData, onProgress?: ProgressFn): 
         }
       }
       const harmonic = centre / (local / Math.max(1, neighbours) + 1e-8);
-      const repeating = clamp((centre - background[k] * 1.15) / (centre + 1e-8), 0, 1);
+      const repeating = clamp((centre - background[k]) / (centre + 1e-8), 0, 1);
       const frequency = (k * workingRate) / (bins * 2);
       const band = clamp((frequency - 60) / 90, 0, 1) * clamp((5200 - frequency) / 1200, 0, 1);
       const salience = clamp((harmonic - 0.8) / 2.2, 0, 1);
-      const value = clamp(repeating * (0.45 + 0.35 * salience + 0.2 * coherence) * (0.35 + 0.65 * band), 0, 1);
+      const value = clamp(repeating * (0.35 + 0.3 * salience + 0.35 * coherence) * (0.35 + 0.65 * band), 0, 1);
       mask[index] = value;
       coherenceSum += coherence;
       maskSum += value;
