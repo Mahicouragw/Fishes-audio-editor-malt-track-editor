@@ -41,6 +41,10 @@ export type HarmonyVoiceJob = {
   clipStart: number;
   effects: RangeEffect[];
   outside: 'silence' | 'preserve';
+  /** Micro-detune in cents (doubled voices), added to `semitones`. */
+  detuneCents?: number;
+  /** 0…1 formant preservation. */
+  formantPreserve?: number;
 };
 export type DecodeWavJob = { kind: 'decodeWav'; buffer: ArrayBuffer };
 
@@ -117,6 +121,8 @@ export function executeJob(request: WorkerJob, onProgress?: ProgressFn): JobOutc
     case 'harmonyVoice': {
       const rendered = renderHarmonyVoice(request.data, request.semitones, request.scope, request.clipStart, {
         outside: request.outside,
+        detuneCents: request.detuneCents,
+        formantPreserve: request.formantPreserve,
         onProgress: progress,
       });
       data = request.effects.length ? applyLayerEffects(rendered, request.effects) : rendered;

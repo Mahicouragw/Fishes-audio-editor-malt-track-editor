@@ -3,7 +3,7 @@ import type { ProjectStore } from '../store/projectStore';
 import { Transport } from './Transport';
 import { Timeline } from './Timeline';
 import { TrackControls, VocalPanel, RangeEffectsPanel } from './EffectsPanel';
-import { HarmonizationPanel, type HarmonyDraft } from './HarmonizationPanel';
+import { HarmonizationPanel, type HarmonyDraft, type HarmonyDraftVoice } from './HarmonizationPanel';
 import { RecordPanel } from './RecordPanel';
 import { SilencePanel } from './SilencePanel';
 import { MergePanel } from './MergePanel';
@@ -11,10 +11,10 @@ import { ExportDialog } from './ExportDialog';
 import { PlaybackEngine, type ScheduledClip } from '../audio/engine';
 import { loadAudioData, storeAudioData, cacheAudioData } from '../storage/assets';
 import { audioDataToAudioBuffer } from '../audio/decode';
-import { resampleAudio } from '../audio/dsp';
+import { resampleAudio, cloneAudio, audioData } from '../audio/dsp';
 import { decodeWav } from '../audio/wav';
 import { encodeWavBlob } from '../audio/wav';
-import { prepareClipData, effectivePitchSemis, harmonyClipFactor, originalVoiceFactor } from '../audio/mixdown';
+import { prepareClipData, effectivePitchSemis, harmonyClipFactor, originalVoiceFactor, effectivePan } from '../audio/mixdown';
 import {
   applyLayerEffects,
   buildSourceTimeline,
@@ -23,6 +23,9 @@ import {
   renderHarmonyVoice,
   sliceClipSegment,
   validateHarmonyRange,
+  validateHarmonyRanges,
+  voicesFromPreset,
+  type HarmonyPreset,
   type HarmonySourceSegment,
   type HarmonyScopeSpec,
 } from '../audio/harmony';
@@ -150,6 +153,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       gain: track.volume * clip.gain
         * harmonyClipFactor(track, clip, project.harmonies)
         * originalVoiceFactor(track, project.harmonies),
+      pan: effectivePan(track, clip, project.harmonies),
     };
   }, [project.harmonies]);
 
@@ -363,7 +367,15 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         });
         const buffer = await audioDataToAudioBuffer(getAudioContext(), data);
         const playable = Math.max(0, Math.min(clip.duration, buffer.duration - clip.sourceStart));
-        rendered.push({ id: clip.id, buffer, start: clip.start, sourceStart: clip.sourceStart, duration: playable, gain: track.volume * clip.gain });
+        rendered.push({
+          id: clip.id,
+          buffer,
+          start: clip.start,
+          sourceStart: clip.sourceStart,
+          duration: playable,
+          gain: track.volume * clip.gain,
+          pan: effectivePan(track, clip, project.harmonies),
+        });
       }
       const end = Math.max(...rendered.map((c) => c.start + c.duration));
       const engine = getEngine();
@@ -379,20 +391,21 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       setPrep({ busy: false, progress: 0, message: '' });
       setError((e as Error).message);
     }
-  }, [getAudioContext, getEngine, store]);
+  }, [getAudioContext, getEngine, project.harmonies, store]);
 
   const handleTrackPitch = useCallback((trackId: string, semitones: number, cents = 0) => {
     store.setTrackPitch(trackId, semitones, cents);
     store.announce(`${(project.tracks.find((t) => t.id === trackId) ?? {}).name ?? 'Track'} pitch applied: ${semitones >= 0 ? '+' : ''}${semitones} semitones${cents ? `, ${cents} cents` : ''}`);
   }, [project.tracks, store]);
 
-  const handleSeparate = useCallback(async () => {
-    if (!selectedTrack || !selectedTrack.clips.length) { setError('Select a track with audio to separate'); return; }
+  const separateTrack = useCallback(async (targetTrack: Track | null | undefined) => {
+    const working = targetTrack ?? selectedTrack;
+    if (!working || !working.clips.length) { setError('Select a track with audio to separate'); return; }
     setError('');
-    store.setVocalState(selectedTrack.id, { status: 'processing', error: undefined, warning: undefined });
-    const clip = selectedTrack.clips[0];
-    const trackId = selectedTrack.id;
-    const trackName = selectedTrack.name;
+    store.setVocalState(working.id, { status: 'processing', error: undefined, warning: undefined });
+    const clip = working.clips[0];
+    const trackId = working.id;
+    const trackName = working.name;
     try {
       let vocal: AudioData;
       let instrumental: AudioData;
@@ -461,10 +474,16 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     }
   }, [selectedTrack, store, dsp]);
 
+  const handleSeparate = useCallback(() => separateTrack(selectedTrack), [selectedTrack, separateTrack]);
+
   // ---------------------------------------------------------------------
   // Harmonization — real rendered voices over the whole song or a range
   // ---------------------------------------------------------------------
   const harmonySourceId = harmonySourceTrackId || project.tracks[0]?.id || '';
+  // One harmonization group per source track; the compare controls act on it.
+  const appliedGroupId = project.harmonies.some((h) => h.groupId === `harmony:${harmonySourceId}`)
+    ? `harmony:${harmonySourceId}`
+    : null;
 
   /**
    * Lay the source track's clips out on one song-timeline buffer. The buffer
@@ -506,35 +525,39 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const renderHarmonyDraft = useCallback(async (
     draft: HarmonyDraft,
     onProgress?: (p: number, message: string) => void,
-  ): Promise<Array<{ semitones: number; gain: number; data: AudioData }>> => {
+  ): Promise<Array<{ voice: HarmonyDraftVoice; data: AudioData }>> => {
     const source = project.tracks.find((t) => t.id === draft.sourceTrackId);
     if (!source) throw new Error('Select a source track that contains audio.');
     if (draft.vocalsOnly && !(source.vocal.status === 'ready' && source.vocal.vocalAssetId)) {
-      throw new Error('Run vocal separation on the source track before harmonizing isolated vocals.');
+      throw new Error('Human Voice Mode needs separated stems. Run vocal separation on the source track first.');
     }
     const { timeline } = await buildHarmonySource(source, draft.vocalsOnly);
     const enabled = draft.voices.filter((v) => v.enabled);
     if (!enabled.length) throw new Error('Enable at least one harmony voice.');
-    const rendered: Array<{ semitones: number; gain: number; data: AudioData }> = [];
+    const rendered: Array<{ voice: HarmonyDraftVoice; data: AudioData }> = [];
     for (let i = 0; i < enabled.length; i++) {
       const voice = enabled[i];
-      const label = `Rendering ${voice.semitones >= 0 ? '+' : ''}${voice.semitones} semitones`;
+      const total = voice.semitones + voice.detuneCents / 100;
+      const label = `Rendering ${voice.name}`;
       onProgress?.(i / enabled.length, label);
       // Rendered in the shared worker so a long song never freezes the page.
-      const outcome = await runDspJob(
-        {
-          kind: 'harmonyVoice',
-          data: timeline,
-          semitones: voice.semitones,
-          scope: draft.scope,
-          clipStart: 0,
-          effects: voice.effects,
-          outside: 'silence',
-        },
-        (p, m) => onProgress?.((i + p) / enabled.length, `${label} — ${m}`),
-      );
+      const outcome = Math.abs(total) < 1e-9
+        ? { data: cloneAudio(timeline) }
+        : await runDspJob(
+          {
+            kind: 'harmonyVoice',
+            data: timeline,
+            semitones: voice.semitones,
+            detuneCents: voice.detuneCents,
+            scope: draft.scope,
+            clipStart: 0,
+            effects: voice.effects,
+            outside: 'silence',
+          },
+          (p, m) => onProgress?.((i + p) / enabled.length, `${label} — ${m}`),
+        );
       if (!outcome.data) throw new Error('Harmony rendering produced no audio');
-      rendered.push({ semitones: voice.semitones, gain: voice.gain, data: outcome.data });
+      rendered.push({ voice, data: outcome.data });
     }
     onProgress?.(1, 'Harmony voices rendered');
     return rendered;
@@ -545,7 +568,21 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     setHarmonyError('');
     try {
       const rendered = await renderHarmonyDraft(draft, (p, m) => setHarmonyProgress({ busy: true, progress: p, message: m }));
-      const mixed = mixVoiceSignals(rendered.map((r) => ({ data: r.data, gain: r.gain })), rendered[0]?.data.sampleRate ?? 44100);
+      // The preview is the same mix the apply step will create: real pitch,
+      // real gains, real delays (the delay is a placement, so it is applied
+      // by shifting each voice inside the preview buffer) and real panning.
+      const longest = rendered.reduce((max, r) => Math.max(max, r.data.length), 0);
+      const mixed = mixVoiceSignals(rendered.map((r) => {
+        const delay = Math.round(r.voice.offsetSeconds * r.data.sampleRate);
+        const shifted = delay > 0
+          ? audioData(r.data.channels.map((channel) => {
+            const out = new Float32Array(longest);
+            out.set(channel.subarray(0, Math.max(0, longest - delay)), delay);
+            return out;
+          }), r.data.sampleRate)
+          : r.data;
+        return { data: shifted, gain: r.voice.gain, pan: r.voice.pan };
+      }), rendered[0]?.data.sampleRate ?? 44100);
       await playPreview('harmony preview (not applied yet)', mixed);
     } catch (e) {
       setHarmonyError((e as Error).message);
@@ -568,8 +605,13 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       setHarmonyError('Enable at least one harmony voice.');
       return;
     }
-    if (draft.scope.scope === 'range') {
-      const problem = validateHarmonyRange(draft.scope.start, draft.scope.end, harmonyMediaDuration);
+    if (draft.vocalsOnly && !(source.vocal.status === 'ready' && source.vocal.vocalAssetId)) {
+      setHarmonyError('Human Voice Mode needs separated stems. Run vocal separation on the source track first.');
+      return;
+    }
+    const ranges = draft.scope.scope === 'range' ? (draft.scope.ranges ?? [{ start: draft.scope.start, end: draft.scope.end }]) : undefined;
+    if (ranges) {
+      const problem = validateHarmonyRanges(ranges, harmonyMediaDuration);
       if (problem) {
         setHarmonyError(problem);
         return;
@@ -578,11 +620,9 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     try {
       setHarmonyProgress({ busy: true, progress: 0, message: 'Preparing source audio' });
       const { timeline, contentDuration } = await buildHarmonySource(source, draft.vocalsOnly);
-      if (draft.scope.scope === 'range') {
-        const overlap = Math.min(draft.scope.end, contentDuration) - Math.max(0, draft.scope.start);
-        if (overlap <= 0) {
-          throw new Error('The selected range does not overlap the source audio.');
-        }
+      if (ranges) {
+        const overlap = ranges.some((r) => Math.min(r.end, contentDuration) - Math.max(0, r.start) > 0);
+        if (!overlap) throw new Error('The selected ranges do not overlap the source audio.');
       }
       const names = harmonyTargetNames(draft, source);
       const trackIds = store.ensureTracks(names.filter(Boolean));
@@ -597,47 +637,55 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       for (let i = 0; i < enabled.length; i++) {
         const voice = enabled[i];
         const targetId = targetIds[i] ?? source.id;
-        setHarmonyProgress({ busy: true, progress: (i + 0.5) / enabled.length, message: `Rendering ${voice.semitones >= 0 ? '+' : ''}${voice.semitones} semitones` });
-        const isOriginal = voice.semitones === 0;
-        if (isOriginal && !draft.separateOriginalTrack) {
-          // The +0 voice reuses the source track's own audio — no duplicate.
+        const total = voice.semitones + voice.detuneCents / 100;
+        const label = voice.name || (Math.abs(total) < 1e-9 ? 'Original lead (+0)' : `Harmony ${voice.semitones >= 0 ? '+' : ''}${voice.semitones}`);
+        setHarmonyProgress({ busy: true, progress: (i + 0.5) / enabled.length, message: `Rendering ${label}` });
+        const isUnprocessedLead = Math.abs(total) < 1e-9 && voice.offsetSeconds === 0;
+        if (isUnprocessedLead && !draft.separateOriginalTrack) {
+          // The +0 lead reuses the source track's own audio — no duplicate.
           voices.push({
-            name: 'Original (+0)',
-            semitones: 0,
+            name: label,
+            semitones: voice.semitones,
             gain: voice.gain,
             muted: false,
             solo: false,
             vocalsOnly: draft.vocalsOnly,
             offsetSeconds: 0,
+            pan: voice.pan,
             effects: [],
             scope: draft.scope.scope,
-            rangeStart: draft.scope.start,
-            rangeEnd: draft.scope.end,
+            rangeStart: ranges?.[0]?.start,
+            rangeEnd: ranges?.[0]?.end,
+            ranges,
             targetTrackId: source.id,
           });
           continue;
         }
-        const renderedOutcome = await runDspJob(
-          {
-            kind: 'harmonyVoice',
-            data: timeline,
-            semitones: voice.semitones,
-            scope: draft.scope,
-            clipStart: 0,
-            effects: voice.effects,
-            outside: 'silence',
-          },
-          (p, m) => setHarmonyProgress({
-            busy: true,
-            progress: (i + p) / enabled.length,
-            message: `Rendering ${voice.semitones >= 0 ? '+' : ''}${voice.semitones} semitones — ${m}`,
-          }),
-        );
+        const renderedOutcome = Math.abs(total) < 1e-9
+          ? { data: cloneAudio(timeline) }
+          : await runDspJob(
+            {
+              kind: 'harmonyVoice',
+              data: timeline,
+              semitones: voice.semitones,
+              detuneCents: voice.detuneCents,
+              scope: draft.scope,
+              clipStart: 0,
+              effects: voice.effects,
+              outside: 'silence',
+            },
+            (p, m) => setHarmonyProgress({
+              busy: true,
+              progress: (i + p) / enabled.length,
+              message: `Rendering ${label} — ${m}`,
+            }),
+          );
         const rendered = renderedOutcome.data;
         if (!rendered) throw new Error('Harmony rendering produced no audio');
-        const label = isOriginal ? 'Original (+0)' : `Harmony ${voice.semitones >= 0 ? '+' : ''}${voice.semitones}`;
         const asset = await storeAudioData(rendered, label, 'processed');
         cacheAudioData(asset.id, rendered);
+        const renderedDuration = rendered.length / rendered.sampleRate;
+        const delay = Math.max(0, Math.min(5, voice.offsetSeconds));
         voices.push({
           name: label,
           semitones: voice.semitones,
@@ -645,16 +693,21 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
           muted: false,
           solo: false,
           vocalsOnly: draft.vocalsOnly,
-          offsetSeconds: voice.offsetSeconds,
+          offsetSeconds: delay,
+          pan: voice.pan,
           effects: voice.effects,
           scope: draft.scope.scope,
-          rangeStart: draft.scope.start,
-          rangeEnd: draft.scope.end,
+          rangeStart: ranges?.[0]?.start,
+          rangeEnd: ranges?.[0]?.end,
+          ranges,
           targetTrackId: targetId,
           clip: {
             assetId: asset.id,
-            start: Math.max(0, voice.offsetSeconds),
-            duration: rendered.length / rendered.sampleRate,
+            // The delay moves the clip inside the song; the tail is trimmed so
+            // a 3:32 song stays 3:32.
+            start: delay,
+            duration: Math.max(0.001, Math.min(renderedDuration, contentDuration - delay)),
+            fullDuration: renderedDuration,
             size: asset.size,
           },
         });
@@ -686,19 +739,24 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       const { timeline } = await buildHarmonySource(source, layer.vocalsOnly);
       const scope: HarmonyScopeSpec = {
         scope: layer.scope,
-        start: layer.rangeStart ?? 0,
-        end: layer.rangeEnd ?? 0,
+        start: layer.ranges?.[0]?.start ?? layer.rangeStart ?? 0,
+        end: layer.ranges?.[0]?.end ?? layer.rangeEnd ?? 0,
+        ranges: layer.ranges,
       };
-      const outcome = await runDspJob(
-        {
-          kind: 'harmonyVoice',
-          data: timeline,
-          semitones,
-          scope,
-          clipStart: 0,
-          effects,
-          outside: 'silence',
-        },
+      const total = semitones + (layer.detuneCents ?? 0) / 100;
+      const outcome = Math.abs(total) < 1e-9
+        ? { data: cloneAudio(timeline) }
+        : await runDspJob(
+          {
+            kind: 'harmonyVoice',
+            data: timeline,
+            semitones,
+            detuneCents: layer.detuneCents ?? 0,
+            scope,
+            clipStart: 0,
+            effects,
+            outside: 'silence',
+          },
         (p, m) => setHarmonyProgress({ busy: true, progress: p, message: m }),
       );
       const rendered = outcome.data;
@@ -706,8 +764,11 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       const label = semitones === 0 ? 'Original (+0)' : `Harmony ${semitones >= 0 ? '+' : ''}${semitones}`;
       const asset = await storeAudioData(rendered, label, 'processed');
       cacheAudioData(asset.id, rendered);
-      store.replaceHarmonyClip(layerId, asset.id, rendered.length / rendered.sampleRate, asset.size, label);
-      store.updateHarmony(layerId, { semitones, effects, name: label });
+      const delay = layer.offsetSeconds ?? 0;
+      const full = rendered.length / rendered.sampleRate;
+      store.replaceHarmonyClip(layerId, asset.id, full, asset.size, label);
+      store.updateHarmony(layerId, { semitones, effects, name: label, clipDuration: full });
+      store.setHarmonyOffset(layerId, delay);
       store.announce(`${label} re-rendered`);
     } catch (e) {
       setHarmonyError((e as Error).message);
@@ -743,7 +804,15 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       const playable = Math.max(0, Math.min(found.clip.duration, buffer.duration - found.clip.sourceStart));
       const engine = getEngine();
       await engine.play(
-        [{ id: found.clip.id, buffer, start: 0, sourceStart: found.clip.sourceStart, duration: playable, gain: layer.muted ? 0 : layer.gain }],
+        [{
+          id: found.clip.id,
+          buffer,
+          start: 0,
+          sourceStart: found.clip.sourceStart,
+          duration: playable,
+          gain: layer.muted ? 0 : layer.gain,
+          pan: layer.pan ?? 0,
+        }],
         0,
         playable,
         { onEnded: () => { setPlaying(false); setPaused(false); } },
@@ -900,10 +969,12 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                     onPreviewPitch={(s) => previewTrack(selectedTrack, s)}
                     onPreviewOriginal={() => previewTrack(selectedTrack)}
                     onVolume={(v) => store.setTrackVolume(selectedTrack.id, v)}
+                    onPan={(value) => store.setTrackPan(selectedTrack.id, value)}
                     onMute={() => store.toggleMute(selectedTrack.id)}
                     onSolo={() => store.toggleSolo(selectedTrack.id)}
                     onRename={(n) => store.renameTrack(selectedTrack.id, n)}
                     onDuplicate={() => store.duplicateTrack(selectedTrack.id)}
+                    onDuplicateOriginal={() => store.duplicateOriginalTrack(selectedTrack.id)}
                     onDelete={() => store.deleteTrack(selectedTrack.id)}
                   />
                   <VocalPanel
@@ -918,7 +989,6 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                       }
                     }}
                     onPitch={(s) => store.setVocalState(selectedTrack.id, { pitchSemis: s })}
-                    onPreserve={(v) => store.setVocalState(selectedTrack.id, { preserveTempo: v })}
                     onVocalVolume={(v) => store.setVocalState(selectedTrack.id, { vocalVolume: v })}
                     onMix={(v) => store.setVocalState(selectedTrack.id, { mixWithAccompaniment: v })}
                     onSeparate={handleSeparate}
@@ -937,10 +1007,43 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                   project.tracks.find((t) => t.id === harmonySourceId)?.vocal.status === 'ready'
                   && project.tracks.find((t) => t.id === harmonySourceId)?.vocal.vocalAssetId,
                 )}
+                onRunSeparation={() => {
+                  const source = project.tracks.find((t) => t.id === harmonySourceId);
+                  void separateTrack(source);
+                }}
+                ranges={project.harmonyRanges ?? []}
+                onAddRange={() => {
+                  const selection = project.selection;
+                  const duration = harmonyMediaDuration || 0;
+                  if (selection && selection.end > selection.start) {
+                    store.addHarmonyRange({ start: selection.start, end: selection.end });
+                    return;
+                  }
+                  const start = 0;
+                  const end = duration > 0 ? Math.min(duration, start + 20) : 20;
+                  store.addHarmonyRange({ start, end: Math.max(start + 0.1, end) });
+                }}
+                onUpdateRange={store.updateHarmonyRange}
+                onRemoveRange={store.removeHarmonyRange}
+                songKey={project.harmonyKey ?? 'C'}
+                scale={project.harmonyScale ?? 'major'}
+                onKeyChange={store.setHarmonyKey}
+                onScaleChange={store.setHarmonyScale}
+                activeGroupId={appliedGroupId}
+                onCompare={(muted) => {
+                  if (appliedGroupId) store.setHarmonyGroupMuted(appliedGroupId, muted);
+                }}
+                onSoloHarmony={() => {
+                  if (appliedGroupId) store.setHarmonyGroupSolo(appliedGroupId, true);
+                }}
                 busy={harmonyProgress.busy || dsp.busy}
                 progress={harmonyProgress.progress}
                 message={harmonyProgress.message}
                 error={harmonyError}
+                canUndo={store.canUndo}
+                canRedo={store.canRedo}
+                onUndo={store.undo}
+                onRedo={store.redo}
                 onPreview={handleHarmonyPreview}
                 onApply={handleHarmonyApply}
                 onCancel={handleHarmonyCancel}

@@ -2,12 +2,16 @@ import { describe, it, expect, afterAll } from 'vitest';
 import {
   HARMONY_PRESET_A,
   HARMONY_PRESET_B,
+  HARMONY_PRESET_C,
   buildSourceTimeline,
+  describeKeyConflict,
   harmonyTargetNames,
   mixVoiceSignals,
   renderHarmonyVoice,
   sliceClipSegment,
   validateHarmonyRange,
+  validateHarmonyRanges,
+  voicesFromPreset,
   voicesFromIntervals,
 } from './harmony';
 import { peak, pitchShift, processVoiceOnly, softLimit } from './dsp';
@@ -240,37 +244,95 @@ describe('synchronization and headroom', () => {
 });
 
 describe('harmony presets', () => {
-  it('Preset A is 0, +4, +7 and Preset B is 0, +3, +7', () => {
-    expect(HARMONY_PRESET_A.intervals).toEqual([0, 4, 7]);
-    expect(HARMONY_PRESET_B.intervals).toEqual([0, 3, 7]);
-    expect(voicesFromIntervals(HARMONY_PRESET_A.intervals).map((v) => v.semitones)).toEqual([0, 4, 7]);
-    expect(voicesFromIntervals(HARMONY_PRESET_B.intervals).map((v) => v.semitones)).toEqual([0, 3, 7]);
+  it('Preset A is the exact four-voice table from the specification', () => {
+    expect(voicesFromPreset(HARMONY_PRESET_A).map((v) => ({
+      semitones: v.semitones,
+      delayMs: Math.round(v.offsetSeconds * 1000),
+      gain: v.gain,
+    }))).toEqual([
+      { semitones: 0, delayMs: 0, gain: 1 },
+      { semitones: 4, delayMs: 23, gain: 0.3 },
+      { semitones: 7, delayMs: 49, gain: 0.4 },
+      { semitones: 0, delayMs: 33, gain: 0.3 },
+    ]);
+    // The +0 double is de-tuned so it cannot comb-filter the lead.
+    expect(voicesFromPreset(HARMONY_PRESET_A)[3].detuneCents).toBe(-6);
+    expect(HARMONY_PRESET_A.intervals).toEqual([0, 4, 7, 0]);
   });
 
-  it('assigns the +0 voice to the source track and the rest to Voice 2 / Voice 3', () => {
-    const voices = voicesFromIntervals(HARMONY_PRESET_A.intervals);
+  it('Preset B is the exact four-voice table from the specification', () => {
+    expect(voicesFromPreset(HARMONY_PRESET_B).map((v) => ({
+      semitones: v.semitones,
+      delayMs: Math.round(v.offsetSeconds * 1000),
+      gain: v.gain,
+    }))).toEqual([
+      { semitones: 0, delayMs: 0, gain: 1 },
+      { semitones: 3, delayMs: 23, gain: 0.3 },
+      { semitones: 7, delayMs: 19, gain: 0.4 },
+      { semitones: 0, delayMs: 5, gain: 0.3 },
+    ]);
+    expect(HARMONY_PRESET_B.intervals).toEqual([0, 3, 7, 0]);
+  });
+
+  it('Preset C is natural double-tracking: four +0 layers, every one detuned', () => {
+    const voices = voicesFromPreset(HARMONY_PRESET_C);
+    expect(voices.map((v) => v.semitones)).toEqual([0, 0, 0, 0]);
+    expect(voices.map((v) => Math.round(v.offsetSeconds * 1000))).toEqual([0, 12, 24, 36]);
+    expect(voices.map((v) => v.gain)).toEqual([1, 0.3, 0.25, 0.2]);
+    expect(voices.map((v) => v.detuneCents)).toEqual([0, -6, 7, -9]);
+    // Doubles are quiet and short-delayed: never an echo, never a chipmunk.
+    for (const voice of voices.slice(1)) {
+      expect(voice.semitones).toBe(0);
+      expect(voice.gain).toBeLessThanOrEqual(0.35);
+      expect(voice.offsetSeconds).toBeLessThanOrEqual(0.04);
+      expect(Math.abs(voice.detuneCents)).toBeGreaterThanOrEqual(3);
+      expect(Math.abs(voice.detuneCents)).toBeLessThanOrEqual(12);
+    }
+  });
+
+  it('assigns the +0 lead to the source track and every harmony voice to its own track', () => {
+    const voices = voicesFromPreset(HARMONY_PRESET_A);
     const names = harmonyTargetNames(voices, 'Voice 1');
     expect(names[0]).toBe('');
-    expect(names[1]).toBe('Voice 2');
-    expect(names[2]).toBe('Voice 3');
+    expect(names[1]).toContain('+4');
+    expect(names[2]).toContain('+7');
+    // A +0 double still needs a track of its own: it carries a detune.
+    expect(names[3]).not.toBe('');
+    expect(new Set(names.filter(Boolean)).size).toBe(3);
+    expect(names.every((name) => name !== 'Voice 1')).toBe(true);
   });
 
   it('never points a harmony voice at the source track itself', () => {
-    const voices = voicesFromIntervals(HARMONY_PRESET_A.intervals);
+    const voices = voicesFromPreset(HARMONY_PRESET_A);
     voices[1].targetTrackName = 'Voice 1';
+    voices[1].name = 'Voice 1';
     const names = harmonyTargetNames(voices, 'Voice 1');
     expect(names[1]).not.toBe('Voice 1');
-    expect(names[1]).toBe('Voice 2');
+    expect(names[1].toLowerCase()).not.toBe('voice 1');
+  });
+
+  it('moves the lead onto its own track when separateOriginalTrack is on', () => {
+    const voices = voicesFromPreset(HARMONY_PRESET_A);
+    const names = harmonyTargetNames(voices, 'Voice 1', true);
+    expect(names[0]).not.toBe('');
+    expect(names.every((name) => name.toLowerCase() !== 'voice 1')).toBe(true);
+    expect(names.filter(Boolean)).toHaveLength(4);
   });
 
   it('renders every enabled voice of a preset independently', () => {
     const song = buildSong(2, SAMPLE_RATE, VOCAL_FREQUENCY, 0);
-    const presetA = voicesFromIntervals(HARMONY_PRESET_A.intervals);
+    const presetA = voicesFromPreset(HARMONY_PRESET_A);
     const rendered = presetA.map((voice) => ({
-      semitones: voice.semitones,
-      data: renderHarmonyVoice(song.vocal, voice.semitones, { scope: 'entire-song', start: 0, end: 0 }, 0),
+      voice,
+      data: renderHarmonyVoice(
+        song.vocal,
+        voice.semitones,
+        { scope: 'entire-song', start: 0, end: 0 },
+        0,
+        { detuneCents: voice.detuneCents },
+      ),
     }));
-    expect(rendered.map((r) => r.semitones)).toEqual([0, 4, 7]);
+    expect(rendered.map((r) => r.voice.semitones)).toEqual([0, 4, 7, 0]);
     for (const voice of rendered) {
       expect(voice.data.length).toBe(song.vocal.length);
     }
@@ -278,10 +340,101 @@ describe('harmony presets', () => {
     const seventh = bandPeak(rendered[2].data.channels[0], SAMPLE_RATE, 460, 540);
     expect(fourth.frequency / (VOCAL_FREQUENCY * semitoneRatio(4))).toBeCloseTo(1, 2);
     expect(seventh.frequency / (VOCAL_FREQUENCY * semitoneRatio(7))).toBeCloseTo(1, 2);
-    // The +0 voice is bit-identical to the source.
+    expect(fourth.amplitude).toBeGreaterThan(0.05);
+    expect(seventh.amplitude).toBeGreaterThan(0.05);
+    // The +0 lead is bit-identical to the source.
     for (let i = 0; i < rendered[0].data.length; i += 31) {
       expect(rendered[0].data.channels[0][i]).toBe(song.vocal.channels[0][i]);
     }
+    // A detuned double is *not* bit-identical, so it cannot phase with the lead.
+    let difference = 0;
+    for (let i = 0; i < rendered[3].data.length; i += 31) {
+      difference += Math.abs(rendered[3].data.channels[0][i] - song.vocal.channels[0][i]);
+    }
+    expect(difference).toBeGreaterThan(0.5);
+  });
+});
+
+describe('multiple non-contiguous ranges', () => {
+  const ranges = [
+    { start: 0.5, end: 1.5 },
+    { start: 3, end: 4 },
+  ];
+
+  it('processes every range independently and leaves the rest silent', () => {
+    const song = buildSong(6, SAMPLE_RATE, VOCAL_FREQUENCY, 0);
+    const rendered = renderHarmonyVoice(song.vocal, 4, { scope: 'range', start: 0, end: 0, ranges }, 0);
+    expect(rendered.length).toBe(song.vocal.length);
+
+    const expected = VOCAL_FREQUENCY * semitoneRatio(4);
+    const window = Math.round(0.3 * SAMPLE_RATE);
+    for (const range of ranges) {
+      const at = Math.round((range.start + 0.4) * SAMPLE_RATE);
+      const level = voiceLevel(rendered, at, at + window, 4);
+      const original = voiceLevel(rendered, at, at + window, 0);
+      expect(level).toBeGreaterThan(0.01);
+      expect(original).toBeLessThan(level * 0.25);
+      expect(bandPeakAmplitude(rendered.channels[0].subarray(at, at + window), SAMPLE_RATE, expected * 0.9, expected * 1.1))
+        .toBeGreaterThan(0);
+    }
+
+    // The gap between the ranges is digitally silent: nothing leaks out.
+    const gapFrom = Math.round(1.7 * SAMPLE_RATE);
+    const gapTo = Math.round(2.8 * SAMPLE_RATE);
+    let gapPeak = 0;
+    for (let i = gapFrom; i < gapTo; i++) gapPeak = Math.max(gapPeak, Math.abs(rendered.channels[0][i]));
+    expect(gapPeak).toBe(0);
+    // Before the first range and after the last one, too.
+    for (let i = 0; i < Math.round(0.4 * SAMPLE_RATE); i += 101) expect(rendered.channels[0][i]).toBe(0);
+    for (let i = Math.round(4.2 * SAMPLE_RATE); i < rendered.length; i += 101) expect(rendered.channels[0][i]).toBe(0);
+  });
+
+  it('fades in and out at the edges instead of clicking', () => {
+    const song = buildSong(6, SAMPLE_RATE, VOCAL_FREQUENCY, 0);
+    const rendered = renderHarmonyVoice(song.vocal, 4, { scope: 'range', start: 0, end: 0, ranges }, 0);
+    const start = Math.round(0.5 * SAMPLE_RATE);
+    const first = Math.abs(rendered.channels[0][start]);
+    const later = Math.abs(rendered.channels[0][start + Math.round(0.05 * SAMPLE_RATE)]);
+    expect(first).toBeLessThan(later * 0.35);
+    // No sudden jump between the last processed sample and the silent gap.
+    const end = Math.round(1.5 * SAMPLE_RATE);
+    expect(Math.abs(rendered.channels[0][end - 1])).toBeLessThan(0.02);
+  });
+
+  it('rejects overlapping or invalid ranges with a clear message', () => {
+    expect(validateHarmonyRanges([], 10)).toMatch(/at least one/i);
+    expect(validateHarmonyRanges([{ start: 1, end: 1 }], 10)).toMatch(/Range 1/i);
+    expect(validateHarmonyRanges([{ start: 0, end: 20 }], 10)).toMatch(/beyond the media duration/i);
+    expect(validateHarmonyRanges([{ start: 1, end: 2 }, { start: 3, end: 4 }], 10)).toBeNull();
+  });
+});
+
+describe('natural double tracking (Preset C)', () => {
+  it('does not cancel or comb-filter the lead', () => {
+    const song = buildSong(2, SAMPLE_RATE, VOCAL_FREQUENCY, 0);
+    const lead = song.vocal.channels[0];
+    const rms = (signal: Float32Array) => Math.sqrt(signal.reduce((sum, v) => sum + v * v, 0) / signal.length);
+    const leadRms = rms(lead);
+    const doubles = voicesFromPreset(HARMONY_PRESET_C).slice(1).map((voice) => ({
+      gain: voice.gain,
+      delay: voice.offsetSeconds,
+      data: renderHarmonyVoice(song.vocal, 0, { scope: 'entire-song', start: 0, end: 0 }, 0, { detuneCents: voice.detuneCents }),
+    }));
+    // Each double alone is quieter than the lead, as the preset specifies.
+    for (const voice of doubles) {
+      expect(rms(voice.data.channels[0])).toBeLessThan(leadRms * 1.2);
+      expect(voice.delay).toBeLessThanOrEqual(0.04);
+      expect(voice.gain).toBeLessThanOrEqual(0.35);
+    }
+    // Summing the doubles with the lead increases the level instead of
+    // cancelling it (a plain copy would comb-filter).
+    const mixed = new Float32Array(lead.length);
+    mixed.set(lead);
+    for (const voice of doubles) {
+      const offset = Math.round(voice.delay * SAMPLE_RATE);
+      for (let i = 0; i + offset < mixed.length; i++) mixed[i + offset] += voice.data.channels[0][i] * voice.gain;
+    }
+    expect(rms(mixed)).toBeGreaterThan(leadRms * 1.05);
   });
 });
 

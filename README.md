@@ -9,10 +9,14 @@ A browser-first, accessible, multitrack audio editor that runs entirely in your 
 - **Home:** Upload Audio (WAV, MP3, M4A/AAC, OGG, FLAC where the browser decoder supports them), Upload Video (MP4/WebM) with real audio extraction, Merge Audio, Remove Silence, Multitrack Editor, Record Voice, Karaoke Recording, Open Recent Project.
 - **Multitrack Studio:** Voice 1–4 + unlimited tracks, rename/select/duplicate/delete/mute/solo/volume, numeric start/duration fields (no drag-only editing), zoom, synchronized playback with a single Web Audio clock, undo/redo, autosave to IndexedDB.
 - **Transport:** Play/Pause/Stop/Skip backward/forward (configurable, default 5s)/Seek/Restart with clamping and proper cleanup on close.
-- **Pitch (tempo preserved):** Real phase-vocoder pitch shifting per track, -24 to +24 semitones, tested at -12/-3/0/+3/+4/+7/+12. Zero is bit-exact. Volume/sample-rate/duration/stereo are preserved.
+- **Pitch (tempo preserved, formant preserved):** Real spectral pitch shifting per track, -24 to +24 semitones, tested at -12/-3/0/+3/+4/+7/+12. **Formants stay at the singer's frequencies** — the shifter never resamples the dry signal, so it cannot turn a voice into a chipmunk (see `HARMONIZATION.md` for the measured before/after). Zero semitones is bit-exact; duration, sample rate and stereo balance are preserved, and the level is matched frame by frame.
 - **Human Voice Processing:** Real ON/OFF toggle. Turning it ON runs the actual separator (local approximate: STFT + REPET-style background estimate + stereo-centre + harmonic-salience mask, or a connected Demucs server), then pitch-shifts **only** the isolated vocal (tempo preserved) and mixes it back with the untouched accompaniment; the original asset is never modified, so A/B comparison is always possible. Turning it OFF uses ordinary whole-track processing. It reports real confidence and the limits of the method — this is never presented as a filter or a checkbox.
-- **Harmonization:** A dedicated panel with the named interval presets (Original +0, minor third +3, major third +4, perfect fifth +7) and free custom intervals including negative semitones. **Preset A = +0/+4/+7** and **Preset B = +0/+3/+7** load a voice list you can edit: enable/disable each voice, set its volume, interval, target track, and preview before applying. The **+0 voice is the original-pitch voice and reuses the source audio** — no duplicated audio is rendered unless you explicitly tick "create a separate track for the original voice". Apply renders every other voice with the phase vocoder (tempo and duration preserved) onto Voice 2, Voice 3, Voice 4 … (created on demand), as one undoable step. Each applied voice can be independently previewed, muted, soloed, gain-adjusted, offset in time, given reverb/echo (re-rendered on demand), duplicated and deleted.
-- **Harmonization scope:** **Entire Song** processes the complete media duration (a 3:32 song is processed as 212 s, from the first sample to the last, not just the visible waveform or the playhead). **Selected Time Range** takes exact start/end times (e.g. `00:05.000`–`00:25.000`), validates them against the real decoded media duration, and changes only that interval; outside it the untouched source keeps playing, so nothing is duplicated. A scope summary is shown before applying.
+- **Harmonization:** Three editable presets — **A: +0/0 ms/100 %, +4/23 ms/30 %, +7/49 ms/40 %, +0/33 ms/30 %**; **B: +0/0/100 %, +3/23/30 %, +7/19/40 %, +0/5/30 %**; **C: natural double-tracking**, four +0 voices at 0/12/24/36 ms and 100/30/25/20 %.** Every pitch, cent-detune, delay, volume, pan, target track and effect is editable. Applying renders real audio onto tracks created on demand, as one undoable step. The **+0 lead reuses the source audio** (bit-identical) and each +0 *double* is micro-detuned so it cannot comb-filter the lead. Applied voices can be previewed, muted, soloed, panned, delayed, gain-adjusted, re-rendered with reverb/echo, duplicated and removed.
+- **Per-track stereo pan:** L / C / R buttons plus a fine −100…+100 slider with spoken labels, applied with a constant-power law in **both** live playback and the exported file. Resolution order is harmony-layer pan → clip pan → track pan. Mono exports have no stereo field and say so.
+- **Lead duplicates:** “Duplicate lead (unprocessed)” copies the selected track onto a new track with zero pitch, no effects, no vocal processing and untouched clip timing, ready to be panned or delayed as a double.
+- **A/B listening:** mute all harmony voices to hear the original, restore them, solo the harmony, or compare processed vs original per track.
+- **Harmonization scope:** **Entire Song** processes the complete media duration (a 3:32 song is processed as 212 s, from the first sample to the last). **Selected Time Ranges** accepts any number of non-contiguous ranges (00:05–00:25, 01:25–01:35, 02:25–02:35, 03:10–03:20, …): add, edit, enable/disable and remove each one with numeric time fields, validated against the real decoded duration. Only samples inside enabled ranges are processed — each is rendered with its own context and short edge fades, and everything outside is digital silence, verified sample by sample. Delays never lengthen the song.
+- **Key & scale:** choose the song key and major/minor scale; intervals that fall outside the key are flagged with a concrete suggestion ("+3 is outside C major — suggested +4") and can be snapped, while the lead stays at its original pitch.
 - **Time-range effects:** Numeric Start/End (e.g., 00:05.000–00:25.000), Apply to Selection only, with tail handling: pitch, harmony, reverb, echo/delay, EQ, volume, fade in/out, noise reduction.
 - **Record/Karaoke:** Real `AudioWorklet` PCM capture (ScriptProcessor fallback), device selection, count-in, level meter, headphone monitoring toggle, retake, synchronized playback.
 - **Merge & Silence:** Real sample-accurate merging, gap/overlap, sequential/timeline; real RMS-based silence detection with threshold/min-duration/preserve, preview and selective removal.
@@ -23,8 +27,9 @@ A browser-first, accessible, multitrack audio editor that runs entirely in your 
 ## Architecture
 
 - **Browser-first:** Web Audio for sync, IndexedDB for projects/assets, Web Workers optional for DSP, LAME for MP3.
-- **DSP:** Windowed-sinc resampling, Hann-window phase vocoder (2048-point FFT) with **identity phase locking** and edge-safe overlap-add normalisation (no end-of-buffer spikes, no level drop on amplitude-modulated voices), biquad EQ, feedback delay, Schroeder reverbs, spectral-gate noise reduction, real WAV encode/decode.
-- **Pitch shifting:** resample to move the pitch, then restore the duration with the phase vocoder — playback rate is never used as a substitute, so tempo and timing are preserved. Zero semitones is bit-exact.
+- **DSP:** Windowed-sinc resampling, Hann-window phase vocoder (2048-point FFT) with **identity phase locking** and edge-safe overlap-add normalisation (no end-of-buffer spikes), biquad EQ, feedback delay, Schroeder reverbs, spectral-gate noise reduction, real WAV encode/decode.
+- **Pitch shifting:** time-stretch → resample → **re-impose the source spectral envelope** (`src/audio/formant.ts`). Tempo and duration are restored exactly, and the formants stay where the singer put them; `formantPreserve: 0` keeps the raw transposition as an honest A/B reference. See `HARMONIZATION.md`.
+- **Mixdown:** one shared constant-power pan law in playback and export, per-frame loudness matching, layer/clip/track pan resolution, layer gain, mute/solo, master fader and a soft limiter.
 - **Vocal separation:** Local approximate (documented) + optional Demucs server (`server/`). See `server/README.md` for setup, `POST /separate`, randomized job IDs, cleanup, and FFmpeg prerequisites.
 
 ## Development
@@ -56,17 +61,25 @@ Dark charcoal studio theme with purple accents, large transport, keyboard/focus 
 
 ## Tests
 
-135 tests across 17 files. The harmonization suite runs against an **actual 3:32 (212 s) stereo WAV file written to disk and read back**:
+174 tests across 20 files (`npx vitest run`). The harmonization suite runs against an **actual 3:32 (212 s) stereo WAV file written to disk and read back**:
 
 - Entire Song processes the full 212 s, and the last 10 s really is pitch-shifted (proving the tail is not skipped).
 - Selected-range processing leaves every sample outside the range untouched (bit-identical) or silent for a voice layer, and shifts only inside it.
 - +0 is bit-exact; +3/+4/+7 and -3/-7 land on the expected frequencies with unchanged duration and no level drop.
 - Human Voice Processing changes the vocal pitch while the accompaniment stays within ±10% of its original level; with it OFF the whole track moves.
-- Both harmony presets load the right intervals, each voice can be disabled independently, and the +0 voice never allocates duplicate audio.
+- All three presets load their exact pitch/delay/volume values, each voice can be disabled independently, and the +0 lead never allocates duplicate audio.
+- Preset C's doubles add level instead of comb-filtering the lead.
+- Every listed range is shifted independently and the gaps between them are **digitally silent**, with fades at the boundaries.
+- Formant preservation beats raw transposition (0.56 vs 0.25 envelope correlation at +7), pitch lands within 0.01 %, and level stays in 0.7–1.3×.
+- Pan is real: a hard-left exported track leaks < 1e-9 into the right channel, centre is bit-identical, and the live playback graph uses the matching constant-power compensation.
 - Exported WAV bytes, decoded back, contain the real processed sound (not the original pitch).
-- Save/reopen preserves every harmony voice's interval, gain, mute, solo, offset, scope, effects and its track arrangement.
+- Save/reopen preserves every harmony voice's interval, gain, mute, solo, offset, scope, effects, pan, ranges, key/scale and its track arrangement.
+- Undo/redo runs in order across pan, key, preset and range edits, coalesces slider drags, and **the history stacks are restored when a saved project is reopened**.
+- An unprocessed lead duplicate really is unprocessed: zero pitch, zero cents, no effects, same asset and timing.
 
 Also covered: decoding/validation, tempo preservation, track sync/selection, range effects, recording helpers, merge/silence, export encoding, accessibility labels, and error/large-file handling.
+
+The engine's behaviour and limits, including the corrected root cause of the old chipmunk sound, are documented in [`HARMONIZATION.md`](HARMONIZATION.md).
 
 ## Remaining work for you
 

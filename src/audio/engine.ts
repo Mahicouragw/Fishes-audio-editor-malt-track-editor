@@ -11,6 +11,8 @@ export interface ScheduledClip {
   duration: number;
   /** Linear gain for this clip (track volume, mute/solo and clip gain already applied). */
   gain: number;
+  /** Stereo position, -1 (hard left) … 0 (centre) … +1 (hard right). */
+  pan?: number;
 }
 
 export interface EngineCallbacks {
@@ -21,6 +23,7 @@ export interface EngineCallbacks {
 interface ActiveSource {
   source: AudioBufferSourceNode;
   gain: GainNode;
+  panner: StereoPannerNode | null;
 }
 
 /**
@@ -83,11 +86,12 @@ export class PlaybackEngine {
 
   private clearSources(): void {
     this.token++;
-    for (const { source, gain } of this.active) {
+    for (const { source, gain, panner } of this.active) {
       source.onended = null;
       try { source.stop(); } catch { /* already ended */ }
       source.disconnect();
       gain.disconnect();
+      panner?.disconnect();
     }
     this.active = [];
   }
@@ -150,9 +154,20 @@ export class PlaybackEngine {
       const source = context.createBufferSource();
       source.buffer = clip.buffer;
       const gain = context.createGain();
-      gain.gain.value = clamp(clip.gain, 0, 4);
+      // The export pan law is unity at centre, so the live panner is
+      // compensated by √2 to match the exported file exactly.
+      const pan = clamp(clip.pan ?? 0, -1, 1);
+      gain.gain.value = clamp(clip.gain, 0, 4) * (pan === 0 ? 1 : Math.SQRT2);
+      let panner: StereoPannerNode | null = null;
       source.connect(gain);
-      gain.connect(this.master ?? context.destination);
+      if (typeof context.createStereoPanner === 'function' && pan !== 0) {
+        panner = context.createStereoPanner();
+        panner.pan.value = pan;
+        gain.connect(panner);
+        panner.connect(this.master ?? context.destination);
+      } else {
+        gain.connect(this.master ?? context.destination);
+      }
       const when = now + Math.max(0, relativeStart);
       try {
         source.start(when, Math.max(0, localOffset), playable);
@@ -165,8 +180,9 @@ export class PlaybackEngine {
         if (currentToken !== this.token) return;
         source.disconnect();
         gain.disconnect();
+        panner?.disconnect();
       };
-      this.active.push({ source, gain });
+      this.active.push({ source, gain, panner });
     }
     this.playing = true;
     this.timer = setInterval(() => {

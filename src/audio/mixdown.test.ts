@@ -21,6 +21,7 @@ function makeTrack(overrides: Partial<Track> = {}): Track {
     id: 'track-1',
     name: 'Voice 1',
     volume: 1,
+    pan: 0,
     muted: false,
     solo: false,
     pitchSemis: 0,

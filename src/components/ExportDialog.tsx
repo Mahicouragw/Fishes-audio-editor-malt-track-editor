@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ExportFormat, ExportScope, Track } from '../types';
 import type { ProjectStore } from '../store/projectStore';
-import { prepareClipData, harmonyClipFactor } from '../audio/mixdown';
+import { prepareClipData, harmonyClipFactor, originalVoiceFactor, effectivePan } from '../audio/mixdown';
 import { mixEntries, type MixEntry } from '../audio/mixdown';
-import { resampleAudio, softLimit, normalize, peak } from '../audio/dsp';
+import { resampleAudio, softLimit, normalize, peak, applyGain } from '../audio/dsp';
 import { audioData } from '../audio/dsp';
 import { encodeWavBlob } from '../audio/wav';
 import { encodeMp3Blob, encodeAacBlob, aacEncoderAvailable, aacUnavailableReason } from '../audio/encoders';
@@ -106,8 +106,15 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
         setMessage(`Rendering ${clip.name} (${track.name})`);
         setProgress(0.05 + 0.55 * (doneClips / totalClips));
         const data = await prepareClipData(track, clip);
-        const factor = harmonyClipFactor(track, clip, project.harmonies);
-        entries.push({ data, start: clip.start, gain: track.volume * clip.gain * factor });
+        const factor = harmonyClipFactor(track, clip, project.harmonies)
+          * originalVoiceFactor(track, project.harmonies);
+        entries.push({
+          data,
+          start: clip.start,
+          gain: track.volume * clip.gain * factor,
+          // The same constant-power pan law the transport uses.
+          pan: effectivePan(track, clip, project.harmonies),
+        });
         doneClips++;
         setProgress(0.05 + 0.55 * (doneClips / totalClips));
       }
@@ -167,7 +174,10 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
         allEntries.push({ ...entry, start: entry.start - rangeOffset });
       }
     }
-    const mix = mixEntries(allEntries, sampleRate, channels);
+    const mixed = mixEntries(allEntries, sampleRate, channels);
+    // The master fader is part of the mix, exactly as it is during playback.
+    const master = store.settings.masterVolume;
+    const mix = master === 1 ? mixed : applyGain(mixed, master);
     const blob = await encode('mix', mix, [0.62, 1]);
     const trackSuffix = scope === 'track' ? ` — ${tracksToExport[0].name.replace(/[^\w\- ]+/g, '')}` : '';
     const rangeSuffix = rangeActive && selection ? ` — ${formatTime(selection.start)}-${formatTime(selection.end)}` : '';
@@ -216,7 +226,7 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
     <div className="dialog-backdrop" role="dialog" aria-modal="true" aria-label="Export audio">
       <div className="dialog">
         <h2>Export Audio</h2>
-        <p className="hint">The exported file reflects committed pitch, tempo, harmonies, vocal processing, effects, timing and the track mix — rendered through the same chain the transport uses. Files are real encodings: WAV is PCM/float, MP3 is LAME, AAC only when the browser provides an encoder (never a renamed file).</p>
+        <p className="hint">The exported file reflects committed pitch, tempo, harmonies, vocal processing, effects, timing, track volume, panning and the master fader — rendered through the same chain the transport uses. Pan is written into stereo exports; a mono export has no stereo field. Files are real encodings: WAV is PCM/float, MP3 is LAME, AAC only when the browser provides an encoder (never a renamed file).</p>
 
         <label className="field">
           <span>Filename</span>

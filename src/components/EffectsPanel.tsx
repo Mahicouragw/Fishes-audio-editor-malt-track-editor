@@ -1,20 +1,23 @@
 import { useEffect, useState } from 'react';
 import type { HarmonyLayer, RangeEffect, Track } from '../types';
 import { formatTime, parseTime, makeId } from '../types';
+import { describePan } from '../audio/harmony';
 
 export function describeSemis(semis: number): string {
   if (semis === 0) return 'original pitch';
   return `${semis > 0 ? 'plus' : 'minus'} ${Math.abs(semis)} semitones`;
 }
 
-export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewOriginal, onVolume, onMute, onSolo, onRename, onDuplicate, onDelete }: {
+export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewOriginal, onVolume, onPan, onMute, onSolo, onRename, onDuplicate, onDuplicateOriginal, onDelete }: {
   track: Track;
   busy: boolean;
   onPitch: (semis: number, cents: number) => void;
   onPreviewPitch: (semis: number) => void;
   onPreviewOriginal: () => void;
   onVolume: (v: number) => void;
-  onMute: () => void; onSolo: () => void; onRename: (n: string) => void; onDuplicate: () => void; onDelete: () => void;
+  onPan: (pan: number) => void;
+  onMute: () => void; onSolo: () => void; onRename: (n: string) => void;
+  onDuplicate: () => void; onDuplicateOriginal: () => void; onDelete: () => void;
 }) {
   const [name, setName] = useState(track.name);
   const [pendingSemis, setPendingSemis] = useState(track.pitchSemis);
@@ -38,13 +41,32 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
       <div className="row">
         <button type="button" className={`btn ${track.muted ? 'btn-active' : ''}`} aria-pressed={track.muted} aria-label={`${track.muted ? 'Unmute' : 'Mute'} ${track.name}`} onClick={onMute}>{track.muted ? 'Unmute' : 'Mute'}</button>
         <button type="button" className={`btn ${track.solo ? 'btn-active' : ''}`} aria-pressed={track.solo} aria-label={`${track.solo ? 'Unsolo' : 'Solo'} ${track.name}`} onClick={onSolo}>Solo</button>
-        <button type="button" className="btn" aria-label={`Duplicate ${track.name}`} onClick={onDuplicate}>Duplicate</button>
+        <button type="button" className="btn" aria-label={`Duplicate ${track.name} with its settings`} onClick={onDuplicate}>Duplicate</button>
+        <button type="button" className="btn" aria-label={`Duplicate ${track.name} at original pitch without effects`} onClick={onDuplicateOriginal}>Duplicate lead (unprocessed)</button>
         <button type="button" className="btn btn-danger" aria-label={`Delete ${track.name}`} onClick={onDelete}>Delete</button>
       </div>
       <label className="field">
         <span>Volume: {Math.round(track.volume * 100)}%</span>
         <input type="range" min={0} max={2} step={0.01} value={track.volume} aria-label={`${track.name} volume, ${Math.round(track.volume * 100)} percent`} onChange={(e) => onVolume(Number(e.target.value))} />
       </label>
+      <fieldset className="field" aria-label={`${track.name} stereo pan`}>
+        <legend>Pan: {describePan(track.pan ?? 0)}</legend>
+        <div className="row wrap">
+          <button type="button" className="btn btn-xs" aria-label={`Pan ${track.name} hard left`} onClick={() => onPan(-1)}>L</button>
+          <button type="button" className="btn btn-xs" aria-label={`Centre the pan of ${track.name}`} onClick={() => onPan(0)}>C</button>
+          <button type="button" className="btn btn-xs" aria-label={`Pan ${track.name} hard right`} onClick={() => onPan(1)}>R</button>
+        </div>
+        <input
+          type="range"
+          min={-1}
+          max={1}
+          step={0.01}
+          value={track.pan ?? 0}
+          aria-label={`${track.name} pan, ${describePan(track.pan ?? 0)}`}
+          onChange={(e) => onPan(Number(e.target.value))}
+        />
+        <p className="hint">Real stereo pan (constant power). It is applied in live playback and in the exported file.</p>
+      </fieldset>
       <div className="field">
         <span>Pitch (preview, then apply): {describeSemis(pendingSemis)}{pendingCents ? `, ${pendingCents > 0 ? '+' : ''}${pendingCents} cents` : ''}</span>
         <div className="row">
@@ -68,15 +90,15 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
           <button type="button" className="btn" aria-label={`Cancel pitch change on ${track.name}`} disabled={busy || !dirty} onClick={() => { setPendingSemis(track.pitchSemis); setPendingCents(track.pitchFineCents); }}>Cancel</button>
           <button type="button" className="btn" aria-label={`Reset pitch of ${track.name} to original`} disabled={busy || (pendingSemis === 0 && pendingCents === 0)} onClick={() => { setPendingSemis(0); setPendingCents(0); }}>Reset</button>
         </div>
-        <p className="hint">Pitch is a real tempo-preserving phase-vocoder shift. Applied pitch is committed to the track; Undo restores the previous value.</p>
+        <p className="hint">Pitch is a real formant-preserving spectral shift: tempo and duration stay identical, and the vocal-tract character is kept. Applied pitch is committed to the track; Undo restores the previous value.</p>
       </div>
     </section>
   );
 }
 
-export function VocalPanel({ track, onToggle, onPitch, onPreserve, onVocalVolume, onMix, onSeparate, onPreview, busy, progress, message }: {
+export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onSeparate, onPreview, busy, progress, message }: {
   track: Track;
-  onToggle: (v: boolean) => void; onPitch: (s: number) => void; onPreserve: (v: boolean) => void; onVocalVolume: (v: number) => void; onMix: (v: boolean) => void;
+  onToggle: (v: boolean) => void; onPitch: (s: number) => void; onVocalVolume: (v: number) => void; onMix: (v: boolean) => void;
   onSeparate: () => void; onPreview: (kind: 'original' | 'vocal' | 'processed') => void;
   busy: boolean; progress: number; message: string;
 }) {
@@ -126,10 +148,10 @@ export function VocalPanel({ track, onToggle, onPitch, onPreserve, onVocalVolume
           (tempo preserved) and mixed with the untouched accompaniment. The track pitch above only applies when this is OFF.
         </p>
       )}
-      <label className="field checkbox">
-        <input type="checkbox" checked={v.preserveTempo} aria-label="Preserve tempo when pitch shifting vocals" disabled={busy} onChange={(e) => onPreserve(e.target.checked)} />
-        <span>Preserve tempo (phase vocoder; unchecking uses a plain resample that changes speed)</span>
-      </label>
+      <p className="hint" role="note">
+        Tempo and duration are always preserved: pitch is shifted by formant-preserving spectral remapping, never by
+        changing playback speed or sample rate.
+      </p>
       <label className="field">
         <span>Vocal volume: {Math.round(v.vocalVolume * 100)}%</span>
         <input type="range" min={0} max={2} step={0.01} value={v.vocalVolume} aria-label="Vocal volume, percent" disabled={busy} onChange={(e) => onVocalVolume(Number(e.target.value))} />

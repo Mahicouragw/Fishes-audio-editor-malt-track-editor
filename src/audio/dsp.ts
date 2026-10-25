@@ -1,6 +1,7 @@
 import type { AudioData, RangeEffect } from '../types';
 import { clamp } from '../types';
 import { fft, ifft } from './fft';
+import { pitchShiftFormant } from './formant';
 
 export type ProgressFn = (progress: number, message: string) => void;
 
@@ -185,31 +186,31 @@ export function timeStretch(data: AudioData, factor: number, onProgress?: Progre
 }
 
 /**
- * Genuine duration-preserving pitch shift: resample to change pitch, then use
- * a phase vocoder to restore the original duration. Zero semitones is bit-exact.
+ * Genuine duration-preserving, formant-preserving pitch shift.
+ *
+ * Bins are remapped in the frequency domain at the original sample rate; the
+ * analysis and synthesis hops are identical, so tempo and duration cannot
+ * change. Zero semitones is bit-exact.
  */
-export function pitchShift(data: AudioData, semitones: number, onProgress?: ProgressFn): AudioData {
+export function pitchShift(
+  data: AudioData,
+  semitones: number,
+  onProgress?: ProgressFn,
+  options: { formantPreserve?: number } = {},
+): AudioData {
   if (!Number.isFinite(semitones)) throw new Error('Pitch must be a finite number');
   if (semitones === 0) return cloneAudio(data);
   if (semitones < -24 || semitones > 24) throw new Error('Pitch range is -24 to +24 semitones');
-  const ratio = 2 ** (semitones / 12);
-  // The phase vocoder needs one analysis window of look-ahead; padding here
-  // keeps the final result exactly the same length as the source.
-  const padded = audioData(
-    data.channels.map((ch) => {
-      const copy = new Float32Array(ch.length + 2048);
-      copy.set(ch);
-      return copy;
-    }),
-    data.sampleRate,
-  );
-  onProgress?.(0.02, 'Resampling for pitch shift');
-  const resampled = resampleByRatio(padded, 1 / ratio, (p) => onProgress?.(0.02 + p * 0.28, 'Resampling for pitch shift'));
-  onProgress?.(0.32, 'Phase-vocoder time stretch');
-  const stretched = timeStretch(resampled, ratio, (p) => onProgress?.(0.32 + p * 0.64, 'Preserving tempo'));
-  const result = fitLength(stretched, data.length);
-  onProgress?.(1, 'Pitch shift complete');
-  return result;
+  // Real pitch shift, implemented in `./formant`: pitch goes up/down by
+  // resampling a *time-stretched* buffer (so duration is restored exactly), and
+  // the spectral envelope is then re-imposed at the original formant
+  // frequencies. The old implementation resampled the raw signal and never put
+  // the formants back — that is precisely what made a shifted voice sound like
+  // a chipmunk. Nothing here changes playback rate or sample rate.
+  return pitchShiftFormant(data, semitones, {
+    formantPreserve: options.formantPreserve ?? 1,
+    onProgress,
+  });
 }
 
 export function applyGain(data: AudioData, gain: number): AudioData {
@@ -815,15 +816,12 @@ export function processVoiceOnly(
   if (options.mixWithAccompaniment && !instrumentalStem) {
     throw new Error('The accompaniment stem is unavailable. Turn off mixing or separate again.');
   }
-  let processed: AudioData;
-  if (options.preserveTempo) {
-    processed = pitchShift(vocalStem, options.semitones, options.onProgress);
-  } else if (options.semitones === 0) {
-    processed = cloneAudio(vocalStem);
-  } else {
-    const ratio = 2 ** (options.semitones / 12);
-    processed = fitLength(resampleByRatio(vocalStem, 1 / ratio), vocalStem.length);
-  }
+  // Pitch is always shifted in the frequency domain with the tempo untouched.
+  // A speed-changing resample is deliberately not offered, so the
+  // `preserveTempo` flag can no longer turn the vocal into a sped-up take.
+  let processed: AudioData = options.semitones === 0
+    ? cloneAudio(vocalStem)
+    : pitchShift(vocalStem, options.semitones, options.onProgress);
   processed = applyGain(processed, options.vocalVolume);
   const length = original.length;
   const channelCount = Math.max(original.channels.length, processed.channels.length);

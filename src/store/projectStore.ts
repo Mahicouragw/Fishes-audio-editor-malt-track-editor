@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AudioData } from '../types';
 import {
   defaultAppSettings, defaultExportSettings, defaultVocalState, makeId,
-  type AppSettings, type Clip, type HarmonyLayer, type HarmonyScope, type Project, type RangeEffect, type RecordingTake, type Track, type VocalState,
+  type AppSettings, type Clip, type HarmonyKey, type HarmonyLayer, type HarmonyRange, type HarmonyScale, type HarmonyScope, type Project, type RangeEffect, type RecordingTake, type Track, type VocalState,
 } from '../types';
 import * as db from '../storage/db';
 import { cacheAudioData, evictAudioData, loadAudioData, storeAudioData, storeBlob } from '../storage/assets';
@@ -16,10 +16,13 @@ export function createEmptyProject(title = 'Untitled Project'): Project {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     tracks: [
-      { id: makeId('track'), name: 'Voice 1', volume: 1, muted: false, solo: false, pitchSemis: 0, pitchFineCents: 0, clips: [], vocal: defaultVocalState() },
-      { id: makeId('track'), name: 'Voice 2', volume: 1, muted: false, solo: false, pitchSemis: 0, pitchFineCents: 0, clips: [], vocal: defaultVocalState() },
+      { id: makeId('track'), name: 'Voice 1', volume: 1, pan: 0, muted: false, solo: false, pitchSemis: 0, pitchFineCents: 0, clips: [], vocal: defaultVocalState() },
+      { id: makeId('track'), name: 'Voice 2', volume: 1, pan: 0, muted: false, solo: false, pitchSemis: 0, pitchFineCents: 0, clips: [], vocal: defaultVocalState() },
     ],
     harmonies: [],
+    harmonyRanges: [],
+    harmonyKey: 'C',
+    harmonyScale: 'major',
     selection: null,
     selectedTrackId: null,
     selectedClipId: null,
@@ -45,8 +48,12 @@ export function normalizeProject(project: Project): Project {
     offsetSeconds: layer.offsetSeconds ?? 0,
     effects: layer.effects ?? [],
     scope: layer.scope ?? 'entire-song',
+    ranges: layer.ranges ?? undefined,
     vocalsOnly: layer.vocalsOnly ?? false,
     gain: typeof layer.gain === 'number' ? layer.gain : 1,
+    pan: typeof layer.pan === 'number' ? layer.pan : 0,
+    detuneCents: layer.detuneCents ?? 0,
+    clipDuration: layer.clipDuration ?? undefined,
     muted: layer.muted ?? false,
     // A legacy layer with rendered audio is not the +0 reference voice.
     originalVoice: layer.originalVoice ?? (layer.semitones === 0 && !layer.clipId),
@@ -60,16 +67,27 @@ export function normalizeProject(project: Project): Project {
       fadeIn: clip.fadeIn ?? 0,
       fadeOut: clip.fadeOut ?? 0,
       sourceStart: clip.sourceStart ?? 0,
+      pan: typeof clip.pan === 'number' ? clip.pan : undefined,
     })),
     vocal: { ...defaultVocalState(), ...(track.vocal ?? {}) },
     pitchSemis: track.pitchSemis ?? 0,
     pitchFineCents: track.pitchFineCents ?? 0,
     volume: typeof track.volume === 'number' ? track.volume : 1,
+    pan: typeof track.pan === 'number' ? track.pan : 0,
   }));
   return {
     ...project,
     harmonies,
     tracks,
+    harmonyRanges: (project.harmonyRanges ?? []).map((range, index) => ({
+      id: range.id ?? makeId('range'),
+      start: Number.isFinite(range.start) ? range.start : 0,
+      end: Number.isFinite(range.end) ? range.end : 0,
+      enabled: range.enabled ?? true,
+      label: range.label ?? `Range ${index + 1}`,
+    })),
+    harmonyKey: project.harmonyKey ?? 'C',
+    harmonyScale: project.harmonyScale ?? 'major',
     media: project.media ?? [],
     recordings: project.recordings ?? [],
     selection: project.selection ?? null,
@@ -81,6 +99,7 @@ export function makeTrack(name: string): Track {
     id: makeId('track'),
     name,
     volume: 1,
+    pan: 0,
     muted: false,
     solo: false,
     pitchSemis: 0,
@@ -117,13 +136,16 @@ export interface HarmonyGroupVoice {
   solo: boolean;
   vocalsOnly: boolean;
   offsetSeconds: number;
+  /** Stereo position, -1…+1 (defaults to centre). */
+  pan?: number;
   effects: RangeEffect[];
   scope: HarmonyScope;
   rangeStart?: number;
   rangeEnd?: number;
+  ranges?: Array<{ start: number; end: number }>;
   targetTrackId: string;
   /** Omitted for the +0 original voice, which reuses the source audio. */
-  clip?: { assetId: string; start: number; duration: number; size: number };
+  clip?: { assetId: string; start: number; duration: number; size: number; fullDuration?: number };
 }
 
 export interface UseProjectOptions {
@@ -138,6 +160,10 @@ export function useProjectStore(options: UseProjectOptions = {}) {
   const [announcement, setAnnouncement] = useState('');
   const history = useRef<Project[]>([]);
   const future = useRef<Project[]>([]);
+  // Slider drags (volume, pan, delay) must not create dozens of undo steps:
+  // consecutive edits of the same control within a short window coalesce into
+  // one history entry.
+  const lastHistory = useRef<{ key: string; time: number } | null>(null);
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const projectRef = useRef(project);
 
@@ -173,9 +199,17 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     setTimeout(() => setAnnouncement(''), 800);
   }, []);
 
-  const pushHistory = useCallback((previous: Project) => {
+  const pushHistory = useCallback((previous: Project, coalesceKey?: string) => {
+    const now = Date.now();
+    const previousEntry = lastHistory.current;
+    if (coalesceKey && previousEntry && previousEntry.key === coalesceKey && now - previousEntry.time < 900) {
+      lastHistory.current = { key: coalesceKey, time: now };
+      future.current = [];
+      return;
+    }
     history.current.push(cloneProject(previous));
     if (history.current.length > 60) history.current.shift();
+    lastHistory.current = coalesceKey ? { key: coalesceKey, time: now } : null;
     future.current = [];
   }, []);
 
@@ -184,16 +218,17 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     autosaveTimer.current = setTimeout(() => {
       db.saveProject(next)
+        .then(() => db.saveHistory(next.id, history.current, future.current))
         .then(() => refreshProjects())
         .catch(() => announce('Autosave failed — storage may be full. Export or delete projects to free space.'));
     }, 900);
   }, [announce, options.autosave, refreshProjects]);
 
-  const updateProject = useCallback((updater: (p: Project) => Project, saveHistory = true) => {
+  const updateProject = useCallback((updater: (p: Project) => Project, saveHistory = true, coalesceKey?: string) => {
     const prev = projectRef.current;
     const next = updater(cloneProject(prev));
     next.updatedAt = Date.now();
-    if (saveHistory && next !== prev) pushHistory(prev);
+    if (saveHistory && next !== prev) pushHistory(prev, coalesceKey);
     commit(next);
     scheduleAutosave(next);
     return next;
@@ -210,6 +245,7 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     const current = projectRef.current;
     try {
       await db.saveProject(current);
+      await db.saveHistory(current.id, history.current, future.current);
     } catch (error) {
       announce(isQuotaError(error) ? 'Save failed: browser storage is full.' : `Save failed: ${(error as Error).message}`);
       throw error;
@@ -221,6 +257,7 @@ export function useProjectStore(options: UseProjectOptions = {}) {
   const saveAs = useCallback(async (title: string) => {
     const next: Project = { ...cloneProject(projectRef.current), id: makeId('project'), title, createdAt: Date.now(), updatedAt: Date.now() };
     await db.saveProject(next);
+    await db.saveHistory(next.id, history.current, future.current);
     commit(next);
     await refreshProjects();
     announce(`Saved as ${title}`);
@@ -229,8 +266,12 @@ export function useProjectStore(options: UseProjectOptions = {}) {
   const openProject = useCallback(async (id: string) => {
     const found = await db.getProject(id);
     if (!found) throw new Error('Project not found');
-    history.current = [];
-    future.current = [];
+    // Undo history belongs to the project: restore it so a reopened project
+    // can still be undone (and redone) in order.
+    const stored = await db.getHistory(id).catch(() => null);
+    history.current = (stored?.past ?? []).map((entry) => normalizeProject(entry));
+    future.current = (stored?.future ?? []).map((entry) => normalizeProject(entry));
+    lastHistory.current = null;
     commit(normalizeProject(found));
     announce(`Opened ${found.title}`);
   }, [announce, commit]);
@@ -239,6 +280,7 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     const next = createEmptyProject(title);
     history.current = [];
     future.current = [];
+    lastHistory.current = null;
     commit(next);
     await db.saveProject(next);
     await refreshProjects();
@@ -248,6 +290,7 @@ export function useProjectStore(options: UseProjectOptions = {}) {
 
   const deleteProject = useCallback(async (id: string) => {
     await db.deleteProject(id);
+    await db.deleteHistory(id).catch(() => undefined);
     await refreshProjects();
     announce('Project deleted');
   }, [announce, refreshProjects]);
@@ -283,6 +326,7 @@ export function useProjectStore(options: UseProjectOptions = {}) {
   };
 
   const undo = useCallback(() => {
+    lastHistory.current = null;
     const previous = history.current.pop();
     if (!previous) return;
     const current = projectRef.current;
@@ -292,6 +336,7 @@ export function useProjectStore(options: UseProjectOptions = {}) {
   }, [announce, commit]);
 
   const redo = useCallback(() => {
+    lastHistory.current = null;
     const next = future.current.pop();
     if (!next) return;
     const current = projectRef.current;
@@ -336,6 +381,42 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     announce('Track duplicated');
   }, [announce, updateProject]);
 
+  /**
+   * Duplicate a track without any processing: same audio, original pitch, no
+   * effects. This is the "double the lead vocal" action — the copy can then be
+   * panned, delayed and levelled independently.
+   */
+  const duplicateOriginalTrack = useCallback((trackId: string) => {
+    updateProject((p) => {
+      const index = p.tracks.findIndex((t) => t.id === trackId);
+      if (index < 0) return p;
+      const source = p.tracks[index];
+      const copy: Track = {
+        ...cloneProject(source as unknown as Project) as unknown as Track,
+        id: makeId('track'),
+        name: `${source.name} double`,
+        pan: source.pan ?? 0,
+        muted: false,
+        solo: false,
+        pitchSemis: 0,
+        pitchFineCents: 0,
+        vocal: defaultVocalState(),
+        clips: source.clips.map((clip) => ({
+          ...clip,
+          id: makeId('clip'),
+          gain: 1,
+          fadeIn: 0,
+          fadeOut: 0,
+          effects: [],
+          pan: undefined,
+        })) as Clip[],
+      };
+      p.tracks.splice(index + 1, 0, copy);
+      return p;
+    });
+    announce('Original track duplicated at original pitch');
+  }, [announce, updateProject]);
+
   const deleteTrack = useCallback((trackId: string) => {
     updateProject((p) => {
       p.tracks = p.tracks.filter((t) => t.id !== trackId);
@@ -353,9 +434,34 @@ export function useProjectStore(options: UseProjectOptions = {}) {
   const setTrackVolume = useCallback((trackId: string, volume: number) => {
     updateProject((p) => {
       const track = p.tracks.find((t) => t.id === trackId);
-      if (track) track.volume = volume;
+      if (track) track.volume = Math.max(0, Math.min(2, volume));
       return p;
-    }, false);
+    }, true, `volume:${trackId}`);
+  }, [updateProject]);
+
+  /**
+   * Set a track's pan. Clips that had their own pan override follow the track
+   * again, so the slider really moves everything on that track.
+   */
+  const setTrackPan = useCallback((trackId: string, pan: number) => {
+    updateProject((p) => {
+      const track = p.tracks.find((t) => t.id === trackId);
+      if (!track) return p;
+      track.pan = Math.max(-1, Math.min(1, pan));
+      for (const clip of track.clips) delete clip.pan;
+      return p;
+    }, true, `pan:${trackId}`);
+  }, [updateProject]);
+
+  /** Independent pan for one clip (used by each harmony voice row). */
+  const setClipPan = useCallback((clipId: string, pan: number) => {
+    updateProject((p) => {
+      for (const track of p.tracks) {
+        const clip = track.clips.find((c) => c.id === clipId);
+        if (clip) clip.pan = Math.max(-1, Math.min(1, pan));
+      }
+      return p;
+    }, true, `clipPan:${clipId}`);
   }, [updateProject]);
 
   const toggleMute = useCallback((trackId: string) => {
@@ -585,10 +691,12 @@ export function useProjectStore(options: UseProjectOptions = {}) {
             solo: voice.solo,
             vocalsOnly: voice.vocalsOnly,
             offsetSeconds: voice.offsetSeconds,
+            pan: voice.pan ?? 0,
             effects: voice.effects,
             scope: voice.scope,
             rangeStart: voice.rangeStart,
             rangeEnd: voice.rangeEnd,
+            ranges: voice.ranges,
             originalVoice: true,
             groupId,
           });
@@ -597,6 +705,7 @@ export function useProjectStore(options: UseProjectOptions = {}) {
         const target = p.tracks.find((t) => t.id === voice.targetTrackId);
         if (!target) continue;
         const clip = makeClip(voice.clip.assetId, voice.name, voice.clip.start, voice.clip.duration);
+        clip.pan = voice.pan ?? 0;
         target.clips.push(clip);
         p.media.push({
           assetId: voice.clip.assetId,
@@ -618,10 +727,13 @@ export function useProjectStore(options: UseProjectOptions = {}) {
           solo: voice.solo,
           vocalsOnly: voice.vocalsOnly,
           offsetSeconds: voice.offsetSeconds,
+          pan: voice.pan ?? 0,
+          clipDuration: voice.clip?.fullDuration ?? voice.clip?.duration,
           effects: voice.effects,
           scope: voice.scope,
           rangeStart: voice.rangeStart,
           rangeEnd: voice.rangeEnd,
+          ranges: voice.ranges,
           originalVoice: false,
           groupId,
         });
@@ -644,27 +756,39 @@ export function useProjectStore(options: UseProjectOptions = {}) {
   }, [announce, updateProject]);
 
   const updateHarmony = useCallback((harmonyId: string, patch: Partial<HarmonyLayer>) => {
+    const slider = typeof patch.gain === 'number' || typeof patch.pan === 'number' || typeof patch.offsetSeconds === 'number';
+    const field = typeof patch.gain === 'number' ? 'gain' : typeof patch.pan === 'number' ? 'pan' : 'offset';
     updateProject((p) => {
       const layer = p.harmonies.find((h) => h.id === harmonyId);
       if (layer) Object.assign(layer, patch);
       return p;
-    }, patch.muted === undefined && patch.gain === undefined && patch.solo === undefined);
+    }, true, slider ? `harmony:${harmonyId}:${field}` : undefined);
   }, [updateProject]);
 
-  /** Move a harmony layer's clip in time without re-rendering it. */
+  /**
+   * Change a harmony voice's delay. The delay moves the clip inside the song
+   * and trims its tail, so a 3:32 song stays 3:32 instead of growing by the
+   * delay. Edits of the same voice coalesce into one undo step.
+   */
   const setHarmonyOffset = useCallback((harmonyId: string, offsetSeconds: number) => {
     updateProject((p) => {
       const layer = p.harmonies.find((h) => h.id === harmonyId);
       if (!layer) return p;
-      layer.offsetSeconds = offsetSeconds;
-      // Harmony clips hold a song-timeline aligned buffer, so their timeline
-      // start is the voice's offset from zero.
+      const next = Math.max(0, Math.min(10, offsetSeconds));
+      const previous = layer.offsetSeconds ?? 0;
+      layer.offsetSeconds = next;
       for (const track of p.tracks) {
         const clip = track.clips.find((c) => c.id === layer.clipId);
-        if (clip) clip.start = Math.max(0, offsetSeconds);
+        if (!clip) continue;
+        // Remember the *rendered* length once, then trim the tail so a delay
+        // never pushes the song longer than it was.
+        const full = layer.clipDuration ?? clip.duration + previous;
+        layer.clipDuration = full;
+        clip.start = next;
+        clip.duration = Math.max(0.001, full - next);
       }
       return p;
-    });
+    }, true, `offset:${harmonyId}`);
   }, [updateProject]);
 
   /** Swap a harmony layer's rendered audio (used when a voice is re-rendered). */
@@ -752,6 +876,64 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     announce('Harmony layer duplicated');
   }, [announce, updateProject, projectRef]);
 
+  /** Mute every voice of one harmonization group in a single undo step. */
+  const setHarmonyGroupMuted = useCallback((groupId: string, muted: boolean) => {
+    updateProject((p) => {
+      for (const layer of p.harmonies) if (layer.groupId === groupId) layer.muted = muted;
+      return p;
+    });
+    announce(muted ? 'Harmony voices muted — hearing the original' : 'Harmony voices restored');
+  }, [announce, updateProject]);
+
+  /** Solo every voice of a group (A/B against the original). */
+  const setHarmonyGroupSolo = useCallback((groupId: string, solo: boolean) => {
+    updateProject((p) => {
+      for (const layer of p.harmonies) if (layer.groupId === groupId) layer.solo = solo;
+      return p;
+    });
+    announce(solo ? 'Soloing harmony voices' : 'Harmony solo released');
+  }, [announce, updateProject]);
+
+  const addHarmonyRange = useCallback((range?: Partial<HarmonyRange>) => {
+    updateProject((p) => {
+      const start = range?.start ?? Math.max(0, Math.min(p.selection?.start ?? 5, 5));
+      const end = range?.end ?? Math.max(start + 0.5, Math.min(p.selection?.end ?? 25, 25));
+      p.harmonyRanges.push({
+        id: makeId('range'),
+        start,
+        end,
+        enabled: range?.enabled ?? true,
+        label: range?.label ?? `Range ${p.harmonyRanges.length + 1}`,
+      });
+      return p;
+    });
+    announce('Time range added');
+  }, [announce, updateProject]);
+
+  const updateHarmonyRange = useCallback((id: string, patch: Partial<HarmonyRange>) => {
+    updateProject((p) => {
+      const range = p.harmonyRanges.find((r) => r.id === id);
+      if (range) Object.assign(range, patch);
+      return p;
+    }, true, `range:${id}`);
+  }, [updateProject]);
+
+  const removeHarmonyRange = useCallback((id: string) => {
+    updateProject((p) => {
+      p.harmonyRanges = p.harmonyRanges.filter((r) => r.id !== id);
+      return p;
+    });
+    announce('Time range removed');
+  }, [announce, updateProject]);
+
+  const setHarmonyKey = useCallback((key: HarmonyKey) => {
+    updateProject((p) => { p.harmonyKey = key; return p; });
+  }, [updateProject]);
+
+  const setHarmonyScale = useCallback((scale: HarmonyScale) => {
+    updateProject((p) => { p.harmonyScale = scale; return p; });
+  }, [updateProject]);
+
   // Import helpers
   const importAudioData = useCallback(async (data: AudioData, name: string, trackId?: string, start?: number, opts: { recording?: boolean } = {}): Promise<string> => {
     const targetId = trackId ?? projectRef.current.tracks[0]?.id;
@@ -778,12 +960,15 @@ export function useProjectStore(options: UseProjectOptions = {}) {
           const data = await loadAudioData(clip.assetId);
           const length = data.length / data.sampleRate;
           // Correct placeholder durations left by imports that could not be
-          // measured immediately.
-          if (Math.abs(clip.duration - length) > 0.02) {
+          // measured immediately. A clip that is deliberately *shorter* than
+          // its asset (a trimmed tail, a delayed harmony voice) is left alone —
+          // otherwise every pass would rewrite the project and re-trigger this
+          // effect forever.
+          if (clip.duration > length + 0.02) {
             updateProject((p) => {
               for (const t of p.tracks) {
                 const c = t.clips.find((x) => x.id === clip.id);
-                if (c) c.duration = Math.min(c.duration || length, length);
+                if (c) c.duration = length;
               }
               return p;
             }, false);
@@ -839,6 +1024,9 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     duplicateTrack,
     deleteTrack,
     setTrackVolume,
+    setTrackPan,
+    setClipPan,
+    duplicateOriginalTrack,
     toggleMute,
     toggleSolo,
     selectTrack,
@@ -859,6 +1047,13 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     removeHarmonyGroup,
     setHarmonyOffset,
     replaceHarmonyClip,
+    setHarmonyGroupMuted,
+    setHarmonyGroupSolo,
+    addHarmonyRange,
+    updateHarmonyRange,
+    removeHarmonyRange,
+    setHarmonyKey,
+    setHarmonyScale,
     importAudioData,
     storeVideoOriginal,
     setSelection,
