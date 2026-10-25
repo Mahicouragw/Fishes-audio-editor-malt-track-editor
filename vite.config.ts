@@ -6,6 +6,8 @@ export default defineConfig({
   base: './',
   plugins: [react()],
   worker: { format: 'es' },
+  preview: { host: '0.0.0.0', allowedHosts: true },
+  server: { host: '0.0.0.0', allowedHosts: true },
   build: { target: 'es2022', chunkSizeWarningLimit: 900 },
   test: {
     environment: 'jsdom',
