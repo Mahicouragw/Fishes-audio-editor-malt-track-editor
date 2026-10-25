@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Navigation } from './components/Navigation';
 import { HomePage } from './components/HomePage';
-import { StudioPage } from './components/StudioPage';
+import { StudioPage, type StudioTab } from './components/StudioPage';
 import { LibraryPage } from './components/LibraryPage';
 import { SettingsPage } from './components/SettingsPage';
 import { useProjectStore } from './store/projectStore';
@@ -11,6 +11,7 @@ export type View = 'home' | 'studio' | 'library' | 'settings';
 export default function App() {
   const store = useProjectStore();
   const [view, setView] = useState<View>('home');
+  const [studioTab, setStudioTab] = useState<StudioTab>('effects');
 
   useEffect(() => {
     const theme = store.settings.theme === 'system'
@@ -30,8 +31,8 @@ export default function App() {
       <a href="#main" className="skip-link">Skip to content</a>
       <Navigation view={view} onView={setView} title={titles[view]} />
       <main id="main" className="main">
-        {view === 'home' && <HomePage store={store} onOpenStudio={() => setView('studio')} />}
-        {view === 'studio' && <StudioPage store={store} />}
+        {view === 'home' && <HomePage store={store} onOpenStudio={(tab) => { if (tab) setStudioTab(tab); setView('studio'); }} />}
+        {view === 'studio' && <StudioPage key={store.project.id} store={store} initialTab={studioTab} />}
         {view === 'library' && <LibraryPage store={store} onOpen={() => setView('studio')} />}
         {view === 'settings' && <SettingsPage store={store} />}
       </main>

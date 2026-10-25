@@ -1,5 +1,6 @@
 import '@testing-library/jest-dom/vitest';
 import 'fake-indexeddb/auto';
+
 if (typeof window !== 'undefined' && !window.matchMedia) {
   (window as unknown as { matchMedia: (q: string) => MediaQueryList }).matchMedia = (query: string) =>
     ({
@@ -14,7 +15,8 @@ if (typeof window !== 'undefined' && !window.matchMedia) {
     }) as unknown as MediaQueryList;
 }
 
-// jsdom has no AudioContext/MediaRecorder — provide minimal stubs for UI tests
+// jsdom has no AudioContext — provide a minimal stub for UI tests.
+// decodeAudioData rejects so tests can never silently use fake audio.
 if (typeof (globalThis as unknown as { AudioContext?: unknown }).AudioContext === 'undefined') {
   class MockAudioContext {
     state = 'running' as AudioContextState;
@@ -37,32 +39,12 @@ if (typeof (globalThis as unknown as { AudioContext?: unknown }).AudioContext ==
   (globalThis as unknown as Record<string, unknown>).AudioContext = MockAudioContext;
   (globalThis as unknown as Record<string, unknown>).webkitAudioContext = MockAudioContext;
 }
-if (typeof navigator !== 'undefined' && !(navigator as unknown as { mediaDevices?: unknown }).mediaDevices) {
-  (navigator as unknown as Record<string, unknown>).mediaDevices = { getUserMedia: async () => { throw new DOMException('NotAllowedError', 'NotAllowedError'); }, enumerateDevices: async () => [] };
-}
 
-// jsdom has no AudioContext/MediaRecorder/speechSynthesis — provide minimal stubs for UI tests
-if (typeof globalThis.AudioContext === 'undefined') {
-  class MockAudioContext {
-    state = 'running';
-    currentTime = 0;
-    sampleRate = 44100;
-    baseLatency = 0;
-    destination = {};
-    createGain() { return { gain: { value: 1, setTargetAtTime() {}, setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {}, disconnect() {} }; }
-    createBuffer() { return { duration: 1, numberOfChannels: 2, sampleRate: 44100, getChannelData: () => new Float32Array(0), copyToChannel() {} }; }
-    createBufferSource() { return { buffer: null, connect() {}, disconnect() {}, start() {}, stop() {}, onended: null }; }
-    createDynamicsCompressor() { return { threshold: { value: 0 }, knee: { value: 0 }, ratio: { value: 0 }, attack: { value: 0 }, release: { value: 0 }, connect() {}, disconnect() {} }; }
-    createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
-    createMediaStreamDestination() { return { stream: {} }; }
-    createAnalyser() { return { fftSize: 1024, getFloatTimeDomainData() {}, connect() {}, disconnect() {} }; }
-    close() { (this as unknown as { state: string }).state = 'closed'; return Promise.resolve(); }
-    resume() { return Promise.resolve(); }
-    suspend() { return Promise.resolve(); }
-  }
-  (globalThis as unknown as Record<string, unknown>).AudioContext = MockAudioContext;
-  (globalThis as unknown as Record<string, unknown>).webkitAudioContext = MockAudioContext;
-}
-if (typeof navigator !== 'undefined' && !navigator.mediaDevices) {
-  (navigator as unknown as Record<string, unknown>).mediaDevices = { getUserMedia: async () => { throw new DOMException('NotAllowedError'); }, enumerateDevices: async () => [] };
+// jsdom has no microphone — getUserMedia rejects so permission errors are
+// exercised honestly (no fake recording streams).
+if (typeof navigator !== 'undefined' && !(navigator as unknown as { mediaDevices?: unknown }).mediaDevices) {
+  (navigator as unknown as Record<string, unknown>).mediaDevices = {
+    getUserMedia: async () => { throw new DOMException('Permission denied', 'NotAllowedError'); },
+    enumerateDevices: async () => [],
+  };
 }

@@ -1,11 +1,23 @@
-import { useState } from 'react';
-import type { ExportFormat, ExportScope } from '../types';
+import { useEffect, useRef, useState } from 'react';
+import type { ExportFormat, ExportScope, Track } from '../types';
 import type { ProjectStore } from '../store/projectStore';
-import { loadAudioData } from '../storage/assets';
-import { applyRangeEffect, pitchShift, resampleAudio, softLimit } from '../audio/dsp';
+import { prepareClipData, harmonyClipFactor } from '../audio/mixdown';
+import { mixEntries, type MixEntry } from '../audio/mixdown';
+import { resampleAudio, softLimit, normalize, peak } from '../audio/dsp';
+import { audioData } from '../audio/dsp';
 import { encodeWavBlob } from '../audio/wav';
 import { encodeMp3Blob, encodeAacBlob, aacEncoderAvailable, aacUnavailableReason } from '../audio/encoders';
 import { formatTime } from '../types';
+
+interface ExportFile {
+  name: string;
+  blob: Blob;
+}
+
+function sanitizeFilename(name: string): string {
+  const cleaned = name.trim().replace(/[\\/:*?"<>|]+/g, '').replace(/\s+/g, ' ');
+  return cleaned || 'wishes-mix';
+}
 
 export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose: () => void }) {
   const [format, setFormat] = useState<ExportFormat>(store.project.exportSettings.format);
@@ -15,83 +27,152 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
   const [bitDepth, setBitDepth] = useState(store.project.exportSettings.bitDepth);
   const [bitrate, setBitrate] = useState(store.project.exportSettings.bitrate);
   const [channels, setChannels] = useState(store.project.exportSettings.channels);
-  const [normalize, setNormalize] = useState(store.project.exportSettings.normalize);
+  const [normalizeOut, setNormalizeOut] = useState(store.project.exportSettings.normalize);
   const [preventClipping, setPreventClipping] = useState(store.project.exportSettings.preventClipping);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const [fileSize, setFileSize] = useState<number | null>(null);
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  const [downloadName, setDownloadName] = useState('');
+  const [files, setFiles] = useState<ExportFile[]>([]);
+  const controllerRef = useRef<AbortController | null>(null);
 
   const aacAvailable = aacEncoderAvailable();
+  const selection = store.project.selection;
+  const urlsRef = useRef<Map<string, string>>(new Map());
 
-  const buildMix = async (abort: AbortSignal) => {
+  // Revoke object URLs when the dialog closes; a new export revokes the
+  // previous set explicitly (below) so links never dangle mid-export.
+  useEffect(() => () => {
+    for (const url of urlsRef.current.values()) URL.revokeObjectURL(url);
+    urlsRef.current.clear();
+  }, []);
+
+  const revokeCurrentFiles = () => {
+    for (const url of urlsRef.current.values()) URL.revokeObjectURL(url);
+    urlsRef.current.clear();
+  };
+
+  const audibleTracks = (project: typeof store.project): Track[] => {
+    const soloed = project.tracks.some((t) => t.solo);
+    return project.tracks.filter((t) => !t.muted && (soloed ? t.solo : true));
+  };
+
+  const renderAndEncode = async (controller: AbortController): Promise<ExportFile[]> => {
     const project = store.project;
     const allClips = project.tracks.flatMap((t) => t.clips.map((c) => ({ clip: c, track: t })));
-    if (!allClips.length) throw new Error('No audio to export');
-    // Determine scope
-    let clipsToRender = allClips;
-    if (scope === 'track') {
-      const trackId = project.selectedTrackId ?? project.tracks[0]?.id;
-      clipsToRender = allClips.filter((x) => x.track.id === trackId);
-      if (!clipsToRender.length) throw new Error('Selected track has no audio');
-    } else if (scope === 'range' && project.selection) {
-      // Clips that overlap selection — effects already include range processing
-      clipsToRender = allClips.filter((x) => x.clip.start < project.selection!.end && x.clip.start + x.clip.duration > project.selection!.start);
-    } else if (scope === 'range' && !project.selection) {
-      throw new Error('Select a time range first');
-    }
-    // Render each clip through its effect chain
-    const rendered = await Promise.all(clipsToRender.map(async ({ clip, track }) => {
-      if (abort.aborted) throw new DOMException('Cancelled', 'AbortError');
-      let data = await loadAudioData(clip.assetId);
-      // Whole-track pitch (real DSP, tempo preserved)
-      if (track.pitchSemis !== 0) data = pitchShift(data, track.pitchSemis);
-      // Clip-local effects
-      for (const effect of clip.effects) {
-        if (!effect.enabled) continue;
-        data = applyRangeEffect(data, effect).data;
-      }
-      // Vocal-only path: if enabled, it replaces the track's contribution; for export we approximate by using vocal asset if present
-      // (full stem mixing is available in the studio preview)
-      return { data, start: clip.start, track };
-    }));
-    const rate = sampleRate;
-    const resampled = rendered.map((r) => ({ ...r, data: resampleAudio(r.data, rate) }));
-    const duration = scope === 'range' && store.project.selection
-      ? store.project.selection.end - store.project.selection.start
-      : Math.max(...resampled.map((r) => r.start + r.data.length / rate), 0);
-    const length = Math.ceil(duration * rate);
-    const outChannels = channels;
-    const mix = Array.from({ length: outChannels }, () => new Float32Array(length));
-    const soloed = store.project.tracks.some((t) => t.solo);
-    for (const { data, start, track } of resampled) {
-      if (abort.aborted) throw new DOMException('Cancelled', 'AbortError');
-      const audible = !track.muted && (soloed ? track.solo : true);
-      if (!audible) continue;
-      const gain = track.volume;
-      const channelData = data.channels;
-      const offset = Math.round(start * rate);
-      const offsetInRange = scope === 'range' && store.project.selection ? Math.round(store.project.selection.start * rate) : 0;
-      for (let c = 0; c < outChannels; c++) {
-        const source = channelData[Math.min(c, channelData.length - 1)];
-        for (let i = 0; i < source.length; i++) {
-          const position = offset - offsetInRange + i;
-          if (position >= 0 && position < length) mix[c][position] += source[i] * gain;
-        }
+    if (!allClips.length) throw new Error('No audio to export — import or record something first');
+
+    const check = () => {
+      if (controller.signal.aborted) throw new DOMException('Export cancelled', 'AbortError');
+    };
+
+    const stems = scope === 'stems';
+    const tracksToExport: Track[] = stems
+      ? audibleTracks(project)
+      : scope === 'track'
+        ? [project.tracks.find((t) => t.id === (project.selectedTrackId ?? project.tracks[0]?.id)) ?? project.tracks[0]]
+        : audibleTracks(project);
+    if (!tracksToExport.length || !tracksToExport[0]) throw new Error('No audible tracks to export');
+    if (scope === 'track' && !tracksToExport[0]) throw new Error('Selected track has no audio');
+
+    const rangeActive = scope === 'range' && !stems;
+    if (rangeActive && !selection) throw new Error('Select a time range first (Shift+drag on the timeline)');
+
+    const clipOverlapsRange = (start: number, duration: number) => {
+      if (!rangeActive || !selection) return true;
+      return start < selection.end && start + duration > selection.start;
+    };
+
+    // Render every clip through its committed chain (pitch, vocal stems,
+    // range effects, fades) on the shared mix bus, so the export always
+    // matches what the transport plays.
+    const perTrack: Record<string, MixEntry[]> = {};
+    let totalClips = 0;
+    for (const track of tracksToExport) {
+      perTrack[track.id] = [];
+      for (const clip of track.clips) {
+        if (clipOverlapsRange(clip.start, clip.duration)) totalClips++;
       }
     }
-    // Normalize / soft limit
-    let peak = 0;
-    for (const ch of mix) for (let i = 0; i < ch.length; i++) peak = Math.max(peak, Math.abs(ch[i]));
-    if (normalize && peak > 0) {
-      const g = 0.95 / peak;
-      for (const ch of mix) for (let i = 0; i < ch.length; i++) ch[i] *= g;
+    if (!totalClips) throw new Error('Nothing to export in the chosen scope');
+
+    let doneClips = 0;
+    const entriesPerTrack: Record<string, MixEntry[]> = {};
+    for (const track of tracksToExport) {
+      const entries: MixEntry[] = [];
+      for (const clip of track.clips) {
+        if (!clipOverlapsRange(clip.start, clip.duration)) continue;
+        check();
+        setMessage(`Rendering ${clip.name} (${track.name})`);
+        setProgress(0.05 + 0.55 * (doneClips / totalClips));
+        const data = await prepareClipData(track, clip);
+        const factor = harmonyClipFactor(track, clip, project.harmonies);
+        entries.push({ data, start: clip.start, gain: track.volume * clip.gain * factor });
+        doneClips++;
+        setProgress(0.05 + 0.55 * (doneClips / totalClips));
+      }
+      entriesPerTrack[track.id] = entries;
     }
-    const audioData = { channels: mix, sampleRate: rate, length } as import('../types').AudioData;
-    return preventClipping ? softLimit(audioData) : audioData;
+
+    const encode = async (label: string, mixData: ReturnType<typeof mixEntries>, stageProgress: [number, number]): Promise<Blob> => {
+      check();
+      let data = mixData;
+      if (normalizeOut) {
+        const p = peak(data);
+        if (p > 0.95) data = softLimit(data);
+        data = normalize(data);
+      }
+      if (preventClipping) data = softLimit(data);
+      setMessage(`Encoding ${label}…`);
+      if (format === 'wav') {
+        return encodeWavBlob(data, { bitDepth, channels, sampleRate });
+      }
+      if (format === 'mp3') {
+        return encodeMp3Blob(data, bitrate, channels, {
+          onProgress: (p, m) => { setProgress(stageProgress[0] + p * (stageProgress[1] - stageProgress[0])); setMessage(m); },
+          signal: controller.signal,
+        });
+      }
+      if (!aacAvailable) throw new Error(aacUnavailableReason());
+      return encodeAacBlob(data, bitrate, channels, {
+        onProgress: (p, m) => { setProgress(stageProgress[0] + p * (stageProgress[1] - stageProgress[0])); setMessage(m); },
+        signal: controller.signal,
+      });
+    };
+
+    const ext = format === 'wav' ? 'wav' : format === 'mp3' ? 'mp3' : 'm4a';
+    const baseName = sanitizeFilename(filename);
+    const out: ExportFile[] = [];
+
+    if (stems) {
+      for (let i = 0; i < tracksToExport.length; i++) {
+        check();
+        const track = tracksToExport[i];
+        const entries = entriesPerTrack[track.id];
+        const rangeOffset = 0;
+        const end = entries.reduce((m, e) => Math.max(m, e.start + e.data.length / e.data.sampleRate), 0);
+        const mix = mixEntries(entries.map((e) => ({ ...e, start: e.start - rangeOffset })), sampleRate, channels);
+        const trackData = audioData(mix.channels, sampleRate);
+        const blob = await encode(`${track.name} stem`, trackData, [0.62 + 0.38 * (i / tracksToExport.length), 0.62 + 0.38 * ((i + 1) / tracksToExport.length)]);
+        out.push({ name: `${baseName} — ${track.name.replace(/[^\w\- ]+/g, '') || `track-${i + 1}`}.${ext}`, blob });
+        check();
+      }
+      return out;
+    }
+
+    const rangeOffset = rangeActive && selection ? selection.start : 0;
+    const allEntries: MixEntry[] = [];
+    for (const track of tracksToExport) {
+      for (const entry of entriesPerTrack[track.id]) {
+        allEntries.push({ ...entry, start: entry.start - rangeOffset });
+      }
+    }
+    const mix = mixEntries(allEntries, sampleRate, channels);
+    const blob = await encode('mix', mix, [0.62, 1]);
+    const trackSuffix = scope === 'track' ? ` — ${tracksToExport[0].name.replace(/[^\w\- ]+/g, '')}` : '';
+    const rangeSuffix = rangeActive && selection ? ` — ${formatTime(selection.start)}-${formatTime(selection.end)}` : '';
+    out.push({ name: `${baseName}${trackSuffix}${rangeSuffix}.${ext}`, blob });
+    return out;
   };
 
   const handleExport = async () => {
@@ -100,45 +181,42 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
     setBusy(true);
     setProgress(0);
     setMessage('Rendering mix');
-    setFileSize(null);
-    if (downloadUrl) URL.revokeObjectURL(downloadUrl);
-    setDownloadUrl(null);
+    revokeCurrentFiles();
+    setFiles([]);
     const controller = new AbortController();
+    controllerRef.current = controller;
     try {
-      const data = await buildMix(controller.signal);
-      setProgress(0.4);
-      setMessage(`Encoding ${format.toUpperCase()}`);
-      let blob: Blob;
-      if (format === 'wav') {
-        blob = encodeWavBlob(data, { bitDepth, channels, sampleRate });
-        setProgress(1);
-      } else if (format === 'mp3') {
-        blob = await encodeMp3Blob(data, bitrate, channels, { onProgress: (p, m) => { setProgress(0.4 + p * 0.6); setMessage(m); }, signal: controller.signal, preventClipping });
-      } else {
-        if (!aacAvailable) throw new Error(aacUnavailableReason());
-        blob = await encodeAacBlob(data, bitrate, channels, { onProgress: (p, m) => { setProgress(0.4 + p * 0.6); setMessage(m); }, signal: controller.signal, preventClipping });
+      const rendered = await renderAndEncode(controller);
+      const next: ExportFile[] = [];
+      for (const file of rendered) {
+        const url = URL.createObjectURL(file.blob);
+        urlsRef.current.set(file.name, url);
+        next.push({ name: file.name, blob: file.blob });
       }
-      setFileSize(blob.size);
-      const ext = format === 'wav' ? 'wav' : format === 'mp3' ? 'mp3' : 'm4a';
-      const name = `${filename.trim()}.${ext}`;
-      const url = URL.createObjectURL(blob);
-      setDownloadUrl(url);
-      setDownloadName(name);
-      setMessage('Export ready');
+      setFiles(next);
       setProgress(1);
-      store.announce(`Exported ${name}`);
+      setMessage('Export ready');
+      store.announce(`Exported ${next.map((f) => f.name).join(', ')}`);
     } catch (e) {
       if ((e as DOMException).name !== 'AbortError') setError((e as Error).message);
+      else store.announce('Export cancelled');
     } finally {
       setBusy(false);
+      controllerRef.current = null;
     }
   };
+
+  const handleCancelExport = () => {
+    controllerRef.current?.abort();
+  };
+
+  const totalSize = files.reduce((sum, f) => sum + f.blob.size, 0);
 
   return (
     <div className="dialog-backdrop" role="dialog" aria-modal="true" aria-label="Export audio">
       <div className="dialog">
         <h2>Export Audio</h2>
-        <p className="hint">The exported file reflects the selected pitch changes, effects, timing, harmonies, and track mix.</p>
+        <p className="hint">The exported file reflects committed pitch, tempo, harmonies, vocal processing, effects, timing and the track mix — rendered through the same chain the transport uses. Files are real encodings: WAV is PCM/float, MP3 is LAME, AAC only when the browser provides an encoder (never a renamed file).</p>
 
         <label className="field">
           <span>Filename</span>
@@ -148,9 +226,9 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
         <label className="field">
           <span>Format</span>
           <select value={format} aria-label="Export format" onChange={(e) => setFormat(e.target.value as ExportFormat)}>
-            <option value="wav">WAV</option>
-            <option value="mp3">MP3</option>
-            <option value="m4a" disabled={!aacAvailable}>AAC/M4A {aacAvailable ? '' : '(unsupported in this browser)'}</option>
+            <option value="wav">WAV (PCM 16/24-bit or 32-bit float)</option>
+            <option value="mp3">MP3 (LAME)</option>
+            <option value="m4a" disabled={!aacAvailable}>AAC/M4A {aacAvailable ? '(browser encoder)' : '(unsupported in this browser)'}</option>
           </select>
         </label>
         {!aacAvailable && format === 'm4a' && <p className="error" role="alert">{aacUnavailableReason()} Choose WAV or MP3 — files are never renamed to fake a format.</p>}
@@ -158,13 +236,13 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
         <label className="field">
           <span>Scope</span>
           <select value={scope} aria-label="Export scope" onChange={(e) => setScope(e.target.value as ExportScope)}>
-            <option value="project">Entire project</option>
-            <option value="range">Selected range {store.project.selection ? `${formatTime(store.project.selection.start)}–${formatTime(store.project.selection.end)}` : '(no range selected)'}</option>
+            <option value="project">Entire project (all audible tracks)</option>
+            <option value="range">Selected range {selection ? `${formatTime(selection.start)}–${formatTime(selection.end)}` : '(no range selected)'}</option>
             <option value="track">Selected track</option>
-            <option value="stems">Individual stems</option>
+            <option value="stems">Individual stems (one file per audible track)</option>
           </select>
         </label>
-        {scope === 'stems' && <p className="hint">Stems export is available as separate WAV/MP3 files per track. Use WAV for lossless stems.</p>}
+        {scope === 'stems' && <p className="hint">Each audible track is rendered separately with its own pitch/vocal/effect chain and downloaded as its own file.</p>}
 
         <div className="row">
           <label className="field">
@@ -188,7 +266,7 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
           {format !== 'wav' && (
             <label className="field">
               <span>Bitrate</span>
-              <select value={bitrate} aria-label="MP3 bitrate" onChange={(e) => setBitrate(Number(e.target.value) as 96 | 128 | 192 | 256 | 320)}>
+              <select value={bitrate} aria-label="MP3 or AAC bitrate" onChange={(e) => setBitrate(Number(e.target.value) as 96 | 128 | 192 | 256 | 320)}>
                 <option value={96}>96 kbps</option>
                 <option value={128}>128 kbps</option>
                 <option value={192}>192 kbps</option>
@@ -207,24 +285,39 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
         </div>
 
         <label className="field checkbox">
-          <input type="checkbox" checked={normalize} aria-label="Normalize export" onChange={(e) => setNormalize(e.target.checked)} />
-          <span>Normalize to -0.5 dB</span>
+          <input type="checkbox" checked={normalizeOut} aria-label="Normalize export" onChange={(e) => setNormalizeOut(e.target.checked)} />
+          <span>Normalize to -0.5 dBFS</span>
         </label>
         <label className="field checkbox">
           <input type="checkbox" checked={preventClipping} aria-label="Prevent clipping" onChange={(e) => setPreventClipping(e.target.checked)} />
           <span>Prevent clipping (soft limiter)</span>
         </label>
 
-        {busy && <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={message}><div className="progress-bar" style={{ width: `${progress * 100}%` }} />{message} {Math.round(progress * 100)}%</div>}
+        {busy && (
+          <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={message}>
+            <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
+            <span aria-live="polite">{message} {Math.round(progress * 100)}%</span>
+          </div>
+        )}
         {error && <div className="error" role="alert">{error}</div>}
-        {fileSize !== null && <p className="hint">File size: {(fileSize / 1024).toFixed(1)} KB</p>}
-        {downloadUrl && (
-          <a className="btn btn-primary" href={downloadUrl} download={downloadName} aria-label={`Download ${downloadName}`} onClick={() => setTimeout(() => URL.revokeObjectURL(downloadUrl), 30000)}>Download {downloadName}</a>
+        {files.length > 0 && (
+          <div className="field">
+            <span>Ready to download {files.length > 1 ? `(${files.length} files, ` : `(`}{files.length > 1 ? `${(totalSize / 1024).toFixed(1)} KB total)` : `${(files[0].blob.size / 1024).toFixed(1)} KB)`}</span>
+            <ul className="region-list" aria-label="Exported files">
+              {files.map((file) => (
+                <li key={file.name} className="merge-item">
+                  <span>{file.name} · {(file.blob.size / 1024).toFixed(1)} KB</span>
+                  <a className="btn btn-primary btn-xs" href={urlsRef.current.get(file.name)} download={file.name} aria-label={`Download ${file.name}`}>Download</a>
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
 
         <div className="row">
           <button type="button" className="btn btn-primary" aria-label="Export audio" disabled={busy} onClick={handleExport}>{busy ? 'Exporting' : 'Export'}</button>
-          <button type="button" className="btn" aria-label="Close export dialog" onClick={() => { if (downloadUrl) URL.revokeObjectURL(downloadUrl); onClose(); }}>Close</button>
+          {busy && <button type="button" className="btn btn-danger" aria-label="Cancel export" onClick={handleCancelExport}>Cancel</button>}
+          <button type="button" className="btn" aria-label="Close export dialog" onClick={onClose}>Close</button>
         </div>
       </div>
     </div>

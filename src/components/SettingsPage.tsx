@@ -1,7 +1,9 @@
+import { useState } from 'react';
 import type { ProjectStore } from '../store/projectStore';
 import { storageEstimate, clearAll } from '../storage/db';
 
 export function SettingsPage({ store }: { store: ProjectStore }) {
+  const [storageStatus, setStorageStatus] = useState('');
   return (
     <div className="settings">
       <h1>Settings</h1>
@@ -82,9 +84,14 @@ export function SettingsPage({ store }: { store: ProjectStore }) {
       <section className="panel" aria-label="Storage management">
         <h2>Storage management</h2>
         <button type="button" className="btn" aria-label="Check storage usage" onClick={async () => {
-          const estimate = await storageEstimate();
-          alert(`Usage ${(estimate.usage / 1024 / 1024).toFixed(1)} MB of ${(estimate.quota / 1024 / 1024).toFixed(1)} MB`);
+          try {
+            const estimate = await storageEstimate();
+            setStorageStatus(`Storage: ${(estimate.usage / 1024 / 1024).toFixed(1)} MB used of ${(estimate.quota / 1024 / 1024).toFixed(1)} MB available.`);
+          } catch {
+            setStorageStatus('Storage usage could not be measured in this browser.');
+          }
         }}>Check storage usage</button>
+        {storageStatus && <p className="hint" role="status">{storageStatus}</p>}
         <button type="button" className="btn btn-danger" aria-label="Clear all local projects and audio" onClick={async () => {
           if (!confirm('Delete all local projects and audio? This cannot be undone.')) return;
           await clearAll();
