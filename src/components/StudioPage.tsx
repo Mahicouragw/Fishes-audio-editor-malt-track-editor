@@ -518,10 +518,23 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     const rendered: Array<{ semitones: number; gain: number; data: AudioData }> = [];
     for (let i = 0; i < enabled.length; i++) {
       const voice = enabled[i];
-      onProgress?.(i / enabled.length, `Rendering ${voice.semitones >= 0 ? '+' : ''}${voice.semitones} semitones`);
-      const shifted = renderHarmonyVoice(timeline, voice.semitones, draft.scope, 0);
-      const voiced = applyLayerEffects(shifted, voice.effects);
-      rendered.push({ semitones: voice.semitones, gain: voice.gain, data: voiced });
+      const label = `Rendering ${voice.semitones >= 0 ? '+' : ''}${voice.semitones} semitones`;
+      onProgress?.(i / enabled.length, label);
+      // Rendered in the shared worker so a long song never freezes the page.
+      const outcome = await runDspJob(
+        {
+          kind: 'harmonyVoice',
+          data: timeline,
+          semitones: voice.semitones,
+          scope: draft.scope,
+          clipStart: 0,
+          effects: voice.effects,
+          outside: 'silence',
+        },
+        (p, m) => onProgress?.((i + p) / enabled.length, `${label} — ${m}`),
+      );
+      if (!outcome.data) throw new Error('Harmony rendering produced no audio');
+      rendered.push({ semitones: voice.semitones, gain: voice.gain, data: outcome.data });
     }
     onProgress?.(1, 'Harmony voices rendered');
     return rendered;
@@ -604,8 +617,24 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
           });
           continue;
         }
-        let rendered = renderHarmonyVoice(timeline, voice.semitones, draft.scope, 0);
-        rendered = applyLayerEffects(rendered, voice.effects);
+        const renderedOutcome = await runDspJob(
+          {
+            kind: 'harmonyVoice',
+            data: timeline,
+            semitones: voice.semitones,
+            scope: draft.scope,
+            clipStart: 0,
+            effects: voice.effects,
+            outside: 'silence',
+          },
+          (p, m) => setHarmonyProgress({
+            busy: true,
+            progress: (i + p) / enabled.length,
+            message: `Rendering ${voice.semitones >= 0 ? '+' : ''}${voice.semitones} semitones — ${m}`,
+          }),
+        );
+        const rendered = renderedOutcome.data;
+        if (!rendered) throw new Error('Harmony rendering produced no audio');
         const label = isOriginal ? 'Original (+0)' : `Harmony ${voice.semitones >= 0 ? '+' : ''}${voice.semitones}`;
         const asset = await storeAudioData(rendered, label, 'processed');
         cacheAudioData(asset.id, rendered);
@@ -660,8 +689,20 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         start: layer.rangeStart ?? 0,
         end: layer.rangeEnd ?? 0,
       };
-      let rendered = renderHarmonyVoice(timeline, semitones, scope, 0);
-      rendered = applyLayerEffects(rendered, effects);
+      const outcome = await runDspJob(
+        {
+          kind: 'harmonyVoice',
+          data: timeline,
+          semitones,
+          scope,
+          clipStart: 0,
+          effects,
+          outside: 'silence',
+        },
+        (p, m) => setHarmonyProgress({ busy: true, progress: p, message: m }),
+      );
+      const rendered = outcome.data;
+      if (!rendered) throw new Error('Harmony rendering produced no audio');
       const label = semitones === 0 ? 'Original (+0)' : `Harmony ${semitones >= 0 ? '+' : ''}${semitones}`;
       const asset = await storeAudioData(rendered, label, 'processed');
       cacheAudioData(asset.id, rendered);

@@ -4,6 +4,7 @@ import {
   removeRegions, resampleByRatio, timeStretch,
   type MergeOptions, type ProgressFn, type SilenceOptions, type SilenceRegion, type VoiceOnlyOptions,
 } from './dsp';
+import { applyLayerEffects, renderHarmonyVoice, type HarmonyScopeSpec } from './harmony';
 import { separateVocalsLocal, type SeparationResult } from './separation';
 import { decodeWav } from './wav';
 import type { AudioData, RangeEffect } from '../types';
@@ -28,12 +29,25 @@ export type DetectSilenceJob = { kind: 'detectSilence'; data: AudioData; options
 export type RemoveSilenceJob = { kind: 'removeSilence'; data: AudioData; regions: SilenceRegion[] };
 export type MergeJob = { kind: 'merge'; datas: AudioData[]; sampleRate: number; options: MergeOptions };
 export type VoiceOnlyJob = { kind: 'voiceOnly'; original: AudioData; vocal: AudioData | null; instrumental: AudioData | null; options: VoiceOnlyOptions };
+/**
+ * Render one harmonization voice. This runs in the shared worker so a long
+ * song does not freeze the page while its voices are rendered.
+ */
+export type HarmonyVoiceJob = {
+  kind: 'harmonyVoice';
+  data: AudioData;
+  semitones: number;
+  scope: HarmonyScopeSpec;
+  clipStart: number;
+  effects: RangeEffect[];
+  outside: 'silence' | 'preserve';
+};
 export type DecodeWavJob = { kind: 'decodeWav'; buffer: ArrayBuffer };
 
 export type WorkerJob =
   | PitchJob | TimeStretchJob | ResampleJob | RangeJob | ReverbJob | EchoJob
   | EqJob | GainJob | NoiseJob | SeparateJob | DetectSilenceJob | RemoveSilenceJob
-  | MergeJob | VoiceOnlyJob | DecodeWavJob;
+  | MergeJob | VoiceOnlyJob | HarmonyVoiceJob | DecodeWavJob;
 
 export type WorkerRequest = WorkerJob & { id: string };
 
@@ -100,6 +114,14 @@ export function executeJob(request: WorkerJob, onProgress?: ProgressFn): JobOutc
     case 'voiceOnly':
       data = processVoiceOnly(request.original, request.vocal, request.instrumental, request.options);
       break;
+    case 'harmonyVoice': {
+      const rendered = renderHarmonyVoice(request.data, request.semitones, request.scope, request.clipStart, {
+        outside: request.outside,
+        onProgress: progress,
+      });
+      data = request.effects.length ? applyLayerEffects(rendered, request.effects) : rendered;
+      break;
+    }
     case 'decodeWav':
       data = decodeWav(request.buffer);
       break;
