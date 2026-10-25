@@ -40,7 +40,10 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    # Publish the site from main, and also from arena/* work branches so a
+    # feature branch can be previewed live without merging it. The github-pages
+    # environment allows administrators to bypass its main-only branch policy.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/arena/')
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
