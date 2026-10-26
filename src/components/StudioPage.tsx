@@ -53,6 +53,31 @@ function clipKey(track: Track, clip: Clip): string {
   return [clip.assetId, effectivePitchSemis(track), vocalKey, clip.fadeIn, clip.fadeOut, JSON.stringify(clip.effects), clip.sourceStart].join('|');
 }
 
+/**
+ * Combine the caller's cancel signal with a hard timeout, so a separation
+ * server that stops answering produces an error instead of a button that
+ * reads "Separating 0 %" for ever. `AbortSignal.any` is not available in older
+ * tablet browsers, so the two signals are wired manually.
+ */
+function requestSignal(parent: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`The separation server did not answer within ${Math.round(timeoutMs / 1000)} seconds`));
+  }, timeoutMs);
+  const forward = () => controller.abort(parent?.reason);
+  if (parent) {
+    if (parent.aborted) forward();
+    else parent.addEventListener('abort', forward, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      parent?.removeEventListener('abort', forward);
+    },
+  };
+}
+
 export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectStore; initialTab?: StudioTab }) {
   const [position, setPosition] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -68,6 +93,14 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   /** What the engine is playing right now: the project timeline or a preview. */
   const [playingPreview, setPlayingPreview] = useState<string | null>(null);
   const lastUiPosition = useRef(0);
+  /** Cancels the harmony render that is currently running (Preview/Apply). */
+  const harmonyAbortRef = useRef<AbortController | null>(null);
+  /** Cancels the playback/export preparation that is currently running. */
+  const prepAbortRef = useRef<AbortController | null>(null);
+  /** Cancels the vocal separation that is currently running. */
+  const sepAbortRef = useRef<AbortController | null>(null);
+  /** Progress of vocal separation, including the network stages of a server. */
+  const [sepRun, setSepRun] = useState({ busy: false, progress: 0, message: '' });
   const engineRef = useRef<PlaybackEngine | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const preparedRef = useRef(new Map<string, Prepared>());
@@ -200,6 +233,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             onProgress: (p, m) => {
               if (token === prepTokenRef.current) setPrep({ busy: true, progress: (i + p) / todo.length, message: `${m} — ${clip.name}` });
             },
+            signal: prepAbortRef.current?.signal,
           });
           const buffer = await audioDataToAudioBuffer(getAudioContext(), data);
           preparedRef.current.set(key, { key, buffer, duration: buffer.duration });
@@ -214,6 +248,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const startPlayback = useCallback(async (from: number) => {
     setError('');
     if (prep.busy) return;
+    prepAbortRef.current = new AbortController();
     try {
       const clips = await ensurePrepared();
       const d = Math.max(0, durationRef.current);
@@ -237,10 +272,18 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       setPlayingPreview(null);
       store.announce(`Playing from ${formatTime(from)}`);
     } catch (e) {
-      setError((e as Error).message);
+      const message = (e as Error).message;
       setPlaying(false);
       setPaused(false);
-      store.announce(`Playback failed: ${(e as Error).message}`);
+      if (/cancelled|interrupted/i.test(message)) {
+        // Cancelling is a user action, not an error.
+        store.announce('Audio processing cancelled');
+      } else {
+        setError(message);
+        store.announce(`Playback failed: ${message}`);
+      }
+    } finally {
+      prepAbortRef.current = null;
     }
   }, [ensurePrepared, getEngine, prep.busy, reportPosition, store]);
 
@@ -425,10 +468,19 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     const working = targetTrack ?? selectedTrack;
     if (!working || !working.clips.length) { setError('Select a track with audio to separate'); return; }
     setError('');
+    // A second run replaces the first instead of queueing behind it.
+    sepAbortRef.current?.abort();
+    const controller = new AbortController();
+    sepAbortRef.current = controller;
+    const stage = (progress: number, message: string) => {
+      if (sepAbortRef.current !== controller) return;
+      setSepRun({ busy: true, progress, message });
+    };
     store.setVocalState(working.id, { status: 'processing', error: undefined, warning: undefined });
     const clip = working.clips[0];
     const trackId = working.id;
     const trackName = working.name;
+    stage(0, 'Loading audio');
     try {
       let vocal: AudioData;
       let instrumental: AudioData;
@@ -436,17 +488,35 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       const apiUrl = store.settings.separationApiUrl.trim();
       if (apiUrl) {
         const data = await loadAudioData(clip.assetId);
+        if (controller.signal.aborted) throw new Error('Separation cancelled');
+        stage(0.06, 'Encoding the track for the separation server');
         const blob = encodeWavBlob(data, { bitDepth: 16, channels: data.channels.length >= 2 ? 2 : 1 });
         const form = new FormData();
         form.append('file', blob, 'track.wav');
         const base = apiUrl.replace(/\/$/, '');
-        const response = await fetch(`${base}/separate`, { method: 'POST', body: form });
+        stage(0.12, 'Uploading to the separation server');
+        // Demucs on a CPU can take minutes, but a request that never answers
+        // must not leave the progress bar at 0 % for ever.
+        const upload = requestSignal(controller.signal, 10 * 60 * 1000);
+        let response: Response;
+        try {
+          response = await fetch(`${base}/separate`, { method: 'POST', body: form, signal: upload.signal });
+        } finally {
+          upload.dispose();
+        }
         if (!response.ok) throw new Error(`Separation server error: ${response.status} ${await response.text()}`);
         const result = (await response.json()) as { vocalUrl?: string; instrumentalUrl?: string; quality?: number; message?: string };
         if (!result.vocalUrl || !result.instrumentalUrl) throw new Error('Separation server did not return vocal and accompaniment stems');
+        stage(0.75, 'Downloading the separated stems');
         const fetchStem = async (rawUrl: string): Promise<AudioData> => {
-          const stemResponse = await fetch(new URL(rawUrl, base).href);
-          if (!stemResponse.ok) throw new Error(`Could not download stem: ${stemResponse.status}`);
+          const download = requestSignal(controller.signal, 2 * 60 * 1000);
+          let stemResponse: Response;
+          try {
+            stemResponse = await fetch(new URL(rawUrl, base).href, { signal: download.signal });
+            if (!stemResponse.ok) throw new Error(`Could not download stem: ${stemResponse.status}`);
+          } finally {
+            download.dispose();
+          }
           const buffer = await stemResponse.arrayBuffer();
           try {
             return decodeWav(buffer);
@@ -468,13 +538,22 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         meta = { quality: result.quality ?? 0.9, method: 'demucs-server', message: 'Separation completed by Demucs server', warning: undefined };
       } else {
         const data = await loadAudioData(clip.assetId);
-        const outcome = await dsp.run({ kind: 'separate', data });
+        if (controller.signal.aborted) throw new Error('Separation cancelled');
+        stage(0.02, 'Separating vocals');
+        const outcome = await dsp.run(
+          { kind: 'separate', data },
+          {
+            signal: controller.signal,
+            onProgress: (p, m) => stage(0.02 + p * 0.9, m),
+          },
+        );
         const separation = (outcome.result ?? outcome.data) as SeparationResult | undefined;
         if (!separation || !separation.vocal) throw new Error('Vocal separation produced no stems');
         vocal = separation.vocal;
         instrumental = separation.instrumental;
         meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: separation.warning };
       }
+      stage(0.94, 'Saving the stems');
       const vocalAsset = await storeAudioData(vocal, `${trackName} vocals`, 'processed');
       const instAsset = await storeAudioData(instrumental, `${trackName} instrumental`, 'processed');
       cacheAudioData(vocalAsset.id, vocal);
@@ -490,12 +569,33 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         warning: meta.warning,
         error: undefined,
       });
+      stage(1, 'Vocal separation complete');
       store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence)`);
     } catch (e) {
-      store.setVocalState(trackId, { status: 'failed', error: (e as Error).message });
-      setError((e as Error).message);
+      const message = (e as Error).message || 'Vocal separation failed';
+      const cancelled = controller.signal.aborted || /cancelled|aborted/i.test(message);
+      store.setVocalState(trackId, { status: cancelled ? 'not-run' : 'failed', error: cancelled ? undefined : message });
+      if (cancelled) {
+        store.announce('Vocal separation cancelled');
+      } else {
+        setError(message);
+      }
+    } finally {
+      if (sepAbortRef.current === controller) {
+        sepAbortRef.current = null;
+        setSepRun({ busy: false, progress: 0, message: '' });
+      }
     }
   }, [selectedTrack, store, dsp]);
+
+  const cancelSeparation = useCallback(() => {
+    // Aborts the worker (which is the only way to stop a synchronous DSP loop)
+    // and any in-flight server request.
+    sepAbortRef.current?.abort();
+    sepAbortRef.current = null;
+    setSepRun({ busy: false, progress: 0, message: '' });
+    store.announce('Vocal separation cancelled');
+  }, [store]);
 
   const handleSeparate = useCallback(() => separateTrack(selectedTrack), [selectedTrack, separateTrack]);
 
@@ -583,6 +683,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             formantPreserve: 1,
           },
           (p, m) => onProgress?.((i + p) / enabled.length, `${label} — ${m}`),
+          { signal: harmonyAbortRef.current?.signal },
         );
       if (!outcome.data) throw new Error('Harmony rendering produced no audio');
       rendered.push({ voice, data: outcome.data });
@@ -594,6 +695,10 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const handleHarmonyPreview = useCallback(async (draft: HarmonyDraft) => {
     setError('');
     setHarmonyError('');
+    // Show the bar before the first (potentially slow) step, so the panel can
+    // never look idle while a long render is starting.
+    setHarmonyProgress({ busy: true, progress: 0, message: 'Preparing source audio' });
+    harmonyAbortRef.current = new AbortController();
     try {
       const rendered = await renderHarmonyDraft(draft, (p, m) => setHarmonyProgress({ busy: true, progress: p, message: m }));
       // The preview is the same mix the apply step will create: real pitch,
@@ -613,9 +718,12 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       }), rendered[0]?.data.sampleRate ?? 44100);
       await playPreview('harmony preview (not applied yet)', mixed);
     } catch (e) {
-      setHarmonyError((e as Error).message);
-      setError((e as Error).message);
+      if (!/cancelled/i.test((e as Error).message)) {
+        setHarmonyError((e as Error).message);
+        setError((e as Error).message);
+      }
     } finally {
+      harmonyAbortRef.current = null;
       setHarmonyProgress({ busy: false, progress: 0, message: '' });
     }
   }, [playPreview, renderHarmonyDraft]);
@@ -645,6 +753,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         return;
       }
     }
+    harmonyAbortRef.current = new AbortController();
     try {
       setHarmonyProgress({ busy: true, progress: 0, message: 'Preparing source audio' });
       const { timeline, contentDuration } = await buildHarmonySource(source, draft.vocalsOnly);
@@ -745,12 +854,20 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       setHarmonyProgress({ busy: false, progress: 0, message: '' });
     } catch (e) {
       setHarmonyProgress({ busy: false, progress: 0, message: '' });
-      setHarmonyError((e as Error).message);
-      setError((e as Error).message);
+      if (!/cancelled/i.test((e as Error).message)) {
+        setHarmonyError((e as Error).message);
+        setError((e as Error).message);
+      }
+    } finally {
+      harmonyAbortRef.current = null;
     }
   }, [buildHarmonySource, harmonyMediaDuration, harmonyTargetNames, project.tracks, store]);
 
   const handleHarmonyCancel = useCallback(() => {
+    // Stop a render that is still running; nothing is applied either way.
+    harmonyAbortRef.current?.abort();
+    harmonyAbortRef.current = null;
+    setHarmonyProgress({ busy: false, progress: 0, message: '' });
     setHarmonyError('');
     store.announce('Harmonization cancelled — nothing was applied');
   }, [store]);
@@ -789,6 +906,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             formantPreserve: 1,
           },
         (p, m) => setHarmonyProgress({ busy: true, progress: p, message: m }),
+        { signal: harmonyAbortRef.current?.signal },
       );
       const rendered = outcome.data;
       if (!rendered) throw new Error('Harmony rendering produced no audio');
@@ -950,9 +1068,26 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       />
 
       {prep.busy && (
-        <div className="progress" role="progressbar" aria-valuenow={Math.round(prep.progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={prep.message}>
-          <div className="progress-bar" style={{ width: `${prep.progress * 100}%` }} />
-          <span>{prep.message} {Math.round(prep.progress * 100)}%</span>
+        <div className="row wrap">
+          <div className="progress" role="progressbar" aria-valuenow={Math.round(prep.progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={prep.message}>
+            <div className="progress-bar" style={{ width: `${prep.progress * 100}%` }} />
+            <span>{prep.message} {Math.round(prep.progress * 100)}%</span>
+          </div>
+          {/* Human-voice rendering can take a while on a long song. The user
+              must always be able to stop it without reloading the page. */}
+          <button
+            type="button"
+            className="btn"
+            aria-label="Cancel audio processing"
+            onClick={() => {
+              prepAbortRef.current?.abort();
+              prepTokenRef.current += 1;
+              setPrep({ busy: false, progress: 0, message: '' });
+              store.announce('Audio processing cancelled');
+            }}
+          >
+            Cancel
+          </button>
         </div>
       )}
 
@@ -1028,7 +1163,10 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                     onMix={(v) => store.setVocalState(selectedTrack.id, { mixWithAccompaniment: v })}
                     onSeparate={handleSeparate}
                     onPreview={handlePreview}
-                    busy={dsp.busy} progress={dsp.progress} message={dsp.message}
+                    busy={sepRun.busy || dsp.busy}
+                    progress={sepRun.busy ? sepRun.progress : dsp.progress}
+                    message={sepRun.busy ? sepRun.message : dsp.message}
+                    onCancel={cancelSeparation}
                   />
                 </>
               )}

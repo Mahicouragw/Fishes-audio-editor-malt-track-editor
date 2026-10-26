@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { runDspJob } from './dspRunner';
 import type { JobOutcome, WorkerJob } from './dspJobs';
+import type { ProgressFn } from './dsp';
 import { terminateSharedWorker } from './sharedWorker';
 
 export { terminateSharedWorker as terminateAudioWorker };
@@ -23,7 +24,10 @@ export function useDsp() {
   const [message, setMessage] = useState('');
   const tokenRef = useRef(0);
 
-  const run = useCallback(async <T extends JobOutcome = JobOutcome>(request: WorkerJob): Promise<T> => {
+  const run = useCallback(async <T extends JobOutcome = JobOutcome>(
+    request: WorkerJob,
+    options: { signal?: AbortSignal; onProgress?: ProgressFn } = {},
+  ): Promise<T> => {
     const token = ++tokenRef.current;
     setBusy(true);
     setProgress(0);
@@ -34,7 +38,10 @@ export function useDsp() {
           setProgress(p);
           setMessage(m);
         }
-      });
+        // Callers that own their own progress UI (vocal separation) get the
+        // same events; a superseded job never reaches them.
+        if (token === tokenRef.current) options.onProgress?.(p, m);
+      }, { signal: options.signal });
       if (token !== tokenRef.current) throw new Error('Job cancelled');
       return outcome as T;
     } finally {

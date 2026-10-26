@@ -96,11 +96,13 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
   );
 }
 
-export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onSeparate, onPreview, busy, progress, message }: {
+export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onSeparate, onPreview, busy, progress, message, onCancel }: {
   track: Track;
   onToggle: (v: boolean) => void; onPitch: (s: number) => void; onVocalVolume: (v: number) => void; onMix: (v: boolean) => void;
   onSeparate: () => void; onPreview: (kind: 'original' | 'vocal' | 'processed') => void;
   busy: boolean; progress: number; message: string;
+  /** Stop a separation that is still running. */
+  onCancel: () => void;
 }) {
   const v = track.vocal;
   return (
@@ -129,6 +131,11 @@ export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onS
           <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
           <span>{message} {Math.round(progress * 100)}%</span>
         </div>
+      )}
+      {busy && (
+        <button type="button" className="btn btn-xs" aria-label="Cancel vocal separation" onClick={onCancel}>
+          Cancel separation
+        </button>
       )}
       <div className="row">
         <button type="button" className="btn btn-primary" aria-label="Run vocal separation" onClick={onSeparate} disabled={busy}>

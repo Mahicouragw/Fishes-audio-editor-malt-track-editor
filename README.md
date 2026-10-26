@@ -27,7 +27,7 @@ A browser-first, accessible, multitrack audio editor that runs entirely in your 
 ## Architecture
 
 - **Browser-first:** Web Audio for sync, IndexedDB for projects/assets, Web Workers optional for DSP, LAME for MP3.
-- **DSP:** Windowed-sinc resampling, Hann-window phase vocoder (2048-point FFT) with **identity phase locking** and edge-safe overlap-add normalisation (no end-of-buffer spikes), biquad EQ, feedback delay, Schroeder reverbs, spectral-gate noise reduction, real WAV encode/decode.
+- **DSP:** Windowed-sinc resampling (a 256-phase kernel table, verified against the direct formula to 1e-4), Hann-window phase vocoder (2048-point FFT) with **identity phase locking** and edge-safe overlap-add normalisation (no end-of-buffer spikes), biquad EQ, feedback delay, Schroeder reverbs, spectral-gate noise reduction, real WAV encode/decode. Every job runs in a Web Worker with a watchdog, real progress reporting, cancellation and a main-thread fallback only when the worker cannot start.
 - **Pitch shifting:** time-stretch → resample → **re-impose the source spectral envelope** (`src/audio/formant.ts`). Tempo and duration are restored exactly, and the formants stay where the singer put them; `formantPreserve: 0` keeps the raw transposition as an honest A/B reference. See `HARMONIZATION.md`.
 - **Mixdown:** one shared constant-power pan law in playback and export, per-frame loudness matching, layer/clip/track pan resolution, layer gain, mute/solo, master fader and a soft limiter.
 - **Vocal separation:** Local approximate (documented) + optional Demucs server (`server/`). See `server/README.md` for setup, `POST /separate`, randomized job IDs, cleanup, and FFmpeg prerequisites.
@@ -61,7 +61,7 @@ Dark charcoal studio theme with purple accents, large transport, keyboard/focus 
 
 ## Tests
 
-203 tests across 22 files (`npx vitest run`). The harmonization suite runs against an **actual 3:32 (212 s) stereo WAV file written to disk and read back**:
+238 tests across 26 files (`npx vitest run`). The harmonization suite runs against an **actual 3:32 (212 s) stereo WAV file written to disk and read back**:
 
 - Entire Song processes the full 212 s, and the last 10 s really is pitch-shifted (proving the tail is not skipped).
 - Selected-range processing leaves every sample outside the range untouched (bit-identical) or silent for a voice layer, and shifts only inside it.
@@ -73,6 +73,9 @@ Dark charcoal studio theme with purple accents, large transport, keyboard/focus 
 - Formant preservation is measured, not claimed: in Presets A and B every voice (+3/+4/+7) follows the *singer's* formant envelope to within 2.7–3.2 dB, while the "the formants moved with the pitch" hypothesis is off by 9.8–14 dB. A plain resample at +7 adds +9.8 dB above 4 kHz and a 1.50× spectral centroid; the shipping shifter adds +1.3 dB and a 0.91× centroid. Pitch lands within 0.01 %, duration is exact and the level stays in 0.7–1.3×.
 - Pan is real: a hard-left exported track leaks < 1e-9 into the right channel, centre is bit-identical, and the live playback graph uses the matching constant-power compensation.
 - Exported WAV bytes, decoded back, contain the real processed sound (not the original pitch).
+- Every DSP job (17 kinds, including human-voice rendering, clip effects and separation) emits a start event at 0 %, live stage messages and a final 100 % — the progress bar cannot sit at 0 % for a whole song again.
+- The worker runner is exercised with a fake worker: a crash, a silent thread and a transfer failure each reject with an actionable message, and cancelling terminates the worker.
+- Separated stems never exceed the input peak (the old overlap-add amplified the buffer edges to 5.4×), the stems reconstruct the input exactly, and separation progress is monotonic on stereo input.
 - Save/reopen preserves every harmony voice's interval, gain, mute, solo, offset, scope, effects, pan, ranges, key/scale and its track arrangement.
 - Undo/redo runs in order across pan, key, preset and range edits, coalesces slider drags, and **the history stacks are restored when a saved project is reopened**.
 - An unprocessed lead duplicate really is unprocessed: zero pitch, zero cents, no effects, same asset and timing.

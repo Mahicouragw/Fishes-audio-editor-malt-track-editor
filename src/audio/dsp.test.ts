@@ -70,6 +70,33 @@ describe('timeStretch', () => {
 });
 
 describe('resample', () => {
+  it('matches the direct windowed-sinc formula exactly where it matters', () => {
+    // The fast path uses a table of 256 interpolation phases. Check it against
+    // the textbook formula it replaces, so a speed-up can never quietly change
+    // the audio.
+    const input = sine(440, 22050, 0.2);
+    const ratio = 0.83;
+    const output = resampleByRatio(input, ratio);
+    const cutoff = Math.min(1, ratio);
+    const half = Math.min(96, Math.max(12, Math.ceil(16 / cutoff)));
+    const sinc = (x: number) => (x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x));
+    let worst = 0;
+    for (let i = 0; i < Math.min(output.length, 4000); i += 17) {
+      const centre = i / ratio;
+      let sum = 0;
+      let weightSum = 0;
+      for (let j = Math.max(0, Math.floor(centre) - half + 1); j < Math.min(input.length, Math.floor(centre) + half); j++) {
+        const x = centre - j;
+        const w = sinc(x * cutoff) * cutoff * (0.5 + 0.5 * Math.cos((Math.PI * x) / half));
+        sum += input.channels[0][j] * w;
+        weightSum += w;
+      }
+      const expected = weightSum === 0 ? 0 : sum / weightSum;
+      worst = Math.max(worst, Math.abs(expected - output.channels[0][i]));
+    }
+    expect(worst).toBeLessThan(1e-4);
+  });
+
   it('round-trips ratio', () => {
     const input = sine(440, 44100, 0.3);
     const down = resampleByRatio(input, 0.5);

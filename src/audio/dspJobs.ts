@@ -82,22 +82,30 @@ export function executeJob(request: WorkerJob, onProgress?: ProgressFn): JobOutc
       data = resampleByRatio(request.data, request.ratio, progress);
       break;
     case 'range': {
-      const r = applyRangeEffect(request.data, request.effect);
+      const r = applyRangeEffect(request.data, request.effect, progress);
       data = r.data;
       result = r;
       break;
     }
     case 'reverb':
+      progress(0, 'Reverb');
       data = applyReverb(request.data, request.seconds, request.mix, request.tail);
+      progress(1, 'Reverb applied');
       break;
     case 'echo':
+      progress(0, 'Echo');
       data = applyEcho(request.data, request.delay, request.feedback, request.mix, request.tail);
+      progress(1, 'Echo applied');
       break;
     case 'eq':
+      progress(0, 'Equaliser');
       data = applyEQ(request.data, request.low, request.mid, request.high);
+      progress(1, 'Equaliser applied');
       break;
     case 'gain':
+      progress(0, 'Gain');
       data = applyGain(request.data, request.gain);
+      progress(1, 'Gain applied');
       break;
     case 'noiseReduction':
       data = reduceNoise(request.data, request.thresholdDb, progress);
@@ -107,16 +115,27 @@ export function executeJob(request: WorkerJob, onProgress?: ProgressFn): JobOutc
       data = (result as SeparationResult).vocal;
       break;
     case 'detectSilence':
+      progress(0, 'Analysing silence');
       result = detectSilence(request.data, request.options);
+      progress(1, 'Silence analysed');
       break;
     case 'removeSilence':
+      progress(0, 'Removing silence');
       data = removeRegions(request.data, request.regions);
+      progress(1, 'Silence removed');
       break;
     case 'merge':
-      data = mergeAudio(request.datas, request.sampleRate, request.options);
+      data = mergeAudio(request.datas, request.sampleRate, request.options, progress);
       break;
     case 'voiceOnly':
-      data = processVoiceOnly(request.original, request.vocal, request.instrumental, request.options);
+      // The progress callback cannot cross the worker boundary inside the job
+      // options (functions are not structured-cloneable), so it is attached at
+      // execution time. Without this the vocal-stem render — the longest job in
+      // the app — reported nothing and every progress bar sat at 0 %.
+      data = processVoiceOnly(request.original, request.vocal, request.instrumental, {
+        ...request.options,
+        onProgress: progress,
+      });
       break;
     case 'harmonyVoice': {
       const rendered = renderHarmonyVoice(request.data, request.semitones, request.scope, request.clipStart, {
@@ -129,7 +148,9 @@ export function executeJob(request: WorkerJob, onProgress?: ProgressFn): JobOutc
       break;
     }
     case 'decodeWav':
+      progress(0, 'Decoding audio');
       data = decodeWav(request.buffer);
+      progress(1, 'Audio decoded');
       break;
     default:
       throw new Error(`Unknown DSP job: ${(request as { kind: string }).kind}`);

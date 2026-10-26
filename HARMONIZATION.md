@@ -180,6 +180,40 @@ Every edit (apply/remove, interval, delay, volume, pan, mute/solo, add/duplicate
 
 The export path is the same chain as playback: committed pitch, vocal separation, range effects, fades, harmony volume/mute/solo, pan, delay placement, track volume, master fader, then the optional limiter. WAV and MP3 are real encoders; AAC is offered only when the browser exposes `MediaRecorder`. There is no renamed-WAV fallback.
 
+## 8b. Progress, failure and cancellation
+
+Every long operation used to be able to look frozen. The root cause of "Human
+Voice Mode stays at 0 %" was that the job executor built the vocal-render call
+without its progress callback (a function cannot be sent through
+`postMessage`, so it has to be attached when the job is *executed*) and the
+range-effect path had no callback at all: those two jobs rendered the entire
+song while emitting **zero** progress events. Measured on a 30 s stereo file:
+0 events before, 334 after.
+
+- **Progress.** All 17 job kinds emit a start event at 0 %, real stage messages
+  and a final 100 %. `jobProgress.test.ts` sweeps every kind and asserts that
+  the sequence is monotonic — a bar that jumps backwards is as broken as one
+  that does not move. `progressWiring.test.tsx` checks the events reach React
+  state and the `role="progressbar"`, and that a crash ends the bar.
+- **Failure.** A worker that throws, cannot transfer its result, or goes
+  completely silent (60 s watchdog) rejects with a message the panel shows. A
+  worker that cannot be created, or a `postMessage` that throws, falls back to
+  the main thread. A worker that *crashed* is never retried on the main thread:
+  the same allocation would freeze the page.
+- **Cancellation.** Human Voice Mode, harmony renders and playback preparation
+  all take an `AbortSignal`. Cancelling terminates the worker (the only way to
+  stop a synchronous DSP loop) and the next job starts a fresh one. The
+  separation panel shows a *Cancel separation* button; a Demucs request has a
+  10-minute upload/post timeout and a 2-minute download timeout, so a dead
+  server produces an error rather than a bar at 0 %.
+- **Memory.** The separator used to store magnitude *and* phase for every frame
+  of every channel: about 150 MB of bookkeeping for a 3:32 stereo song on top of
+  the audio itself. It now streams one frame at a time through a three-frame ring
+  buffer. Measured peak RSS on that song: **680 MB → 522 MB**, same output,
+  same speed (≈14 s). That allocation is what makes a tablet browser kill the
+  worker mid-render — which, before the watchdog, was indistinguishable from a
+  bar stuck at 0 %.
+
 ## 9. What still depends on the environment
 
 - **Vocal separation.** The in-browser separator is a documented approximation (STFT + REPET-style background estimate + stereo-centre + harmonic-salience mask). A Demucs server (`server/`) gives better stems. GitHub Pages cannot run Python, so a hosted server must be deployed separately; when no separation exists the panel *disables* Human Voice Mode and offers to run separation rather than pretending.

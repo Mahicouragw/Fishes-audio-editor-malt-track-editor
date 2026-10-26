@@ -634,7 +634,9 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
       <div className="row wrap">
         <button type="button" className="btn" aria-label="Preview harmony" onClick={() => run(false)} disabled={busy}>Preview</button>
         <button type="button" className="btn btn-primary" aria-label="Apply harmony" onClick={() => run(true)} disabled={busy}>Apply</button>
-        <button type="button" className="btn" aria-label="Cancel harmony" onClick={props.onCancel} disabled={busy}>Cancel</button>
+        {/* Cancel stays enabled while a render is running: it stops the job
+            instead of leaving the panel busy until the page is reloaded. */}
+        <button type="button" className="btn" aria-label="Cancel harmony" onClick={props.onCancel}>Cancel</button>
         <button type="button" className="btn" aria-label="Reset harmony to original pitch" onClick={resetToOriginal} disabled={busy}>Reset to original pitch</button>
         <button type="button" className="btn" aria-label="Undo last edit" onClick={onUndo} disabled={!canUndo || busy}>Undo</button>
         <button type="button" className="btn" aria-label="Redo last undone edit" onClick={onRedo} disabled={!canRedo || busy}>Redo</button>

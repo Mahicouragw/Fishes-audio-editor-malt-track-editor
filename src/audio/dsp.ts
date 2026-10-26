@@ -53,27 +53,63 @@ export function resampleByRatio(data: AudioData, ratio: number, onProgress?: Pro
   const step = 1 / ratio;
   const cutoff = Math.min(1, ratio);
   const half = Math.min(96, Math.max(12, Math.ceil(16 / cutoff)));
+
+  // The interpolation weight of a tap depends only on the *fractional* position
+  // of the sample being reconstructed, not on the sample index. Building that
+  // kernel once turns two transcendental calls per tap (sinc + cosine) into one
+  // table lookup. Resampling is a third of the pitch shifter's runtime and the
+  // pitch shifter is what Human Voice Processing runs over a whole song, so
+  // this is the difference between a progress bar that moves and one that does
+  // not. The table is linearly interpolated between phases, which is accurate
+  // to better than 1e-6 of a sample.
+  const PHASES = 256;
+  const taps = 2 * half - 1;
+  const kernel = new Float64Array((PHASES + 1) * taps);
+  for (let phase = 0; phase <= PHASES; phase++) {
+    const fraction = phase / PHASES;
+    const row = phase * taps;
+    for (let k = -(half - 1); k <= half - 1; k++) {
+      // x is the distance from the reconstructed position to the tap:
+      //   x = center - (base + k) = fraction - k
+      const x = fraction - k;
+      const windowValue = 0.5 + 0.5 * Math.cos((Math.PI * x) / half);
+      kernel[row + k + half - 1] = sinc(x * cutoff) * cutoff * windowValue;
+    }
+  }
+
   const out = data.channels.map(() => new Float32Array(outputLength));
   for (let c = 0; c < data.channels.length; c++) {
     const input = data.channels[c];
     const output = out[c];
     for (let i = 0; i < outputLength; i++) {
       const center = i * step;
-      const from = Math.max(0, Math.floor(center) - half + 1);
-      const to = Math.min(inputLength, Math.floor(center) + half);
+      const base = Math.floor(center);
+      if (base >= inputLength) {
+        output[i] = 0;
+        if (onProgress && c === 0 && i % 16384 === 0) onProgress(i / outputLength, 'Resampling');
+        continue;
+      }
+      const position = (center - base) * PHASES;
+      const phase = Math.min(PHASES - 1, Math.floor(position));
+      const fraction = position - phase;
+      const rowA = phase * taps;
+      const rowB = rowA + taps;
+      // j = base + k, restricted to real samples and to the kernel's support.
+      const fromK = Math.max(-(half - 1), -base);
+      const toK = Math.min(half - 1, inputLength - 1 - base);
       let sum = 0;
       let weightSum = 0;
-      for (let j = from; j < to; j++) {
-        const x = center - j;
-        const window = 0.5 + 0.5 * Math.cos((Math.PI * x) / half);
-        const w = sinc(x * cutoff) * cutoff * window;
-        sum += input[j] * w;
+      for (let k = fromK; k <= toK; k++) {
+        const index = k + half - 1;
+        const w = kernel[rowA + index] * (1 - fraction) + kernel[rowB + index] * fraction;
+        sum += input[base + k] * w;
         weightSum += w;
       }
       output[i] = weightSum === 0 ? 0 : sum / weightSum;
       if (onProgress && c === 0 && i % 16384 === 0) onProgress(i / outputLength, 'Resampling');
     }
   }
+  onProgress?.(1, 'Resampling complete');
   return audioData(out, data.sampleRate);
 }
 
@@ -201,6 +237,7 @@ export function timeStretch(
       }
     }
   }
+  onProgress?.(1, 'Time stretch complete');
   return audioData(result, data.sampleRate);
 }
 
@@ -447,8 +484,14 @@ export function reduceNoise(data: AudioData, thresholdDb: number, onProgress?: P
   const frames = Math.max(1, Math.floor((data.length - N) / hop) + 1);
   const noiseFrames = Math.min(frames, Math.max(1, Math.ceil((0.12 * data.sampleRate) / hop)));
   const threshold = 10 ** (thresholdDb / 20);
-  return audioData(
+  const result = audioData(
     data.channels.map((input, channelIndex) => {
+      // Each channel owns one contiguous slice of the bar: the channels are
+      // processed one after another, so only a contiguous band keeps the
+      // reported progress monotonic. Half of the band is the analysis pass and
+      // half is the synthesis pass.
+      const channelSpan = 1 / Math.max(1, data.channels.length);
+      const channelBase = channelIndex * channelSpan;
       const magnitudes = new Float32Array(frames * (N / 2 + 1));
       const phases = new Float32Array(frames * (N / 2 + 1));
       const re = new Float64Array(N);
@@ -463,7 +506,7 @@ export function reduceNoise(data: AudioData, thresholdDb: number, onProgress?: P
           magnitudes[f * (N / 2 + 1) + k] = Math.hypot(re[k], im[k]);
           phases[f * (N / 2 + 1) + k] = Math.atan2(im[k], re[k]);
         }
-        if (onProgress && channelIndex === 0 && f % 32 === 0) onProgress(f / frames / 2, 'Analysing noise');
+        if (onProgress && f % 32 === 0) onProgress(channelBase + (f / frames) * channelSpan * 0.5, 'Analysing noise');
       }
       const noiseFloor = new Float32Array(N / 2 + 1);
       for (let k = 0; k <= N / 2; k++) {
@@ -498,13 +541,27 @@ export function reduceNoise(data: AudioData, thresholdDb: number, onProgress?: P
             windowSum[pos] += window[n] * window[n];
           }
         }
-        if (onProgress && channelIndex === 0 && f % 32 === 0) onProgress(0.5 + f / frames / 2, 'Reducing noise');
+        if (onProgress && f % 32 === 0) onProgress(channelBase + channelSpan * (0.5 + (f / frames) * 0.5), 'Reducing noise');
       }
-      for (let i = 0; i < output.length; i++) output[i] = windowSum[i] > 1e-8 ? output[i] / windowSum[i] : 0;
+      // Steady-state normalisation plus an edge fade: dividing by the small
+      // partial sum at the buffer edges amplified the residue into full-scale
+      // clicks (the same defect the separated stems had).
+      const steady = Math.max(windowSum[Math.floor(output.length / 2)] || 0, 0.5);
+      for (let i = 0; i < output.length; i++) output[i] = windowSum[i] > 0 ? output[i] / steady : 0;
+      const fade = Math.min(hop * 3, Math.floor(output.length / 8));
+      for (let i = 0; i < fade; i++) {
+        const gain = 0.5 - 0.5 * Math.cos((Math.PI * i) / fade);
+        output[i] *= gain;
+        output[output.length - 1 - i] *= gain;
+      }
       return output;
     }),
     data.sampleRate,
   );
+  // Reported once, after every channel: announcing 100 % inside the per-channel
+  // map made the bar jump 100 % → 50 % on the second channel.
+  onProgress?.(1, 'Noise reduction complete');
+  return result;
 }
 
 export interface SilenceRegion {
@@ -624,9 +681,19 @@ export interface MergeOptions {
 }
 
 /** Real sample-accurate merging: sequential concatenation or timeline mixing. */
-export function mergeAudio(datas: AudioData[], sampleRate: number, options: MergeOptions): AudioData {
+export function mergeAudio(
+  datas: AudioData[],
+  sampleRate: number,
+  options: MergeOptions,
+  onProgress?: ProgressFn,
+): AudioData {
   if (!datas.length) throw new Error('Import at least one audio file to merge');
-  const rateMatched = datas.map((d) => resampleAudio(d, sampleRate));
+  onProgress?.(0, 'Preparing files');
+  const rateMatched = datas.map((d, index) => {
+    const match = resampleAudio(d, sampleRate);
+    onProgress?.(((index + 1) / Math.max(1, datas.length)) * 0.5, 'Matching sample rates');
+    return match;
+  });
   const starts: number[] = [];
   if (options.mode === 'timeline' && options.timelineStarts?.length === datas.length) {
     starts.push(...options.timelineStarts.map((s) => Math.max(0, s)));
@@ -648,7 +715,9 @@ export function mergeAudio(datas: AudioData[], sampleRate: number, options: Merg
       const input = d.channels[Math.min(c, d.channels.length - 1)];
       for (let i = 0; i < input.length; i++) out[c][start + i] += input[i];
     }
+    onProgress?.(0.5 + ((index + 1) / Math.max(1, rateMatched.length)) * 0.5, 'Mixing files');
   });
+  onProgress?.(1, 'Merge complete');
   return audioData(out, sampleRate);
 }
 
@@ -683,8 +752,15 @@ export interface RangeResult {
   tailSeconds: number;
 }
 
-/** Apply an effect to a clip-local time range. Outside audio stays untouched (except wet effect tails). */
-export function applyRangeEffect(data: AudioData, effect: RangeEffect): RangeResult {
+/**
+ * Apply an effect to a clip-local time range. Outside audio stays untouched
+ * (except wet effect tails).
+ *
+ * `onProgress` is threaded through to the expensive inner work (a pitch shift
+ * or a harmony stack, a noise reduction) and always reports a start and an end,
+ * so a UI progress bar can never sit at 0 % for the whole render.
+ */
+export function applyRangeEffect(data: AudioData, effect: RangeEffect, onProgress?: ProgressFn): RangeResult {
   const rate = data.sampleRate;
   const durationSeconds = data.length / rate;
   if (effect.start >= effect.end) throw new Error('Start time must be earlier than end time');
@@ -705,18 +781,23 @@ export function applyRangeEffect(data: AudioData, effect: RangeEffect): RangeRes
   let processed: AudioData;
   let tailSeconds = 0;
 
+  const pitchProgress = (from: number, span: number): ProgressFn =>
+    (value, message) => onProgress?.(from + value * span, message);
+  onProgress?.(0, `Applying ${effect.type}`);
+
   switch (effect.type) {
     case 'pitch': {
-      processed = pitchShift(padded, p.semitones ?? 0);
+      processed = pitchShift(padded, p.semitones ?? 0, pitchProgress(0, 0.9));
       break;
     }
     case 'harmony': {
       const intervals = p.intervals ?? [0, 4, 7];
       const gain = p.harmonyGain ?? 0.35;
       processed = cloneAudio(padded);
-      for (const semitones of intervals) {
-        if (semitones === 0) continue;
-        const layer = pitchShift(padded, semitones);
+      const shifted = intervals.filter((semitones) => semitones !== 0);
+      for (let index = 0; index < shifted.length; index++) {
+        const semitones = shifted[index];
+        const layer = pitchShift(padded, semitones, pitchProgress(index / Math.max(1, shifted.length), 0.9 / Math.max(1, shifted.length)));
         for (let c = 0; c < processed.channels.length; c++) {
           const source = layer.channels[Math.min(c, layer.channels.length - 1)];
           for (let i = 0; i < processed.length; i++) processed.channels[c][i] += source[i] * gain;
@@ -752,11 +833,12 @@ export function applyRangeEffect(data: AudioData, effect: RangeEffect): RangeRes
       fadeInside(processed, localStart, localEnd, 'out');
       break;
     case 'noiseReduction':
-      processed = reduceNoise(padded, p.noiseThresholdDb ?? -40);
+      processed = reduceNoise(padded, p.noiseThresholdDb ?? -40, pitchProgress(0, 0.9));
       break;
     default:
       throw new Error(`Unsupported effect: ${effect.type}`);
   }
+  onProgress?.(0.95, `Applying ${effect.type}`);
 
   const totalLength = Math.max(data.length, paddedStart + processed.length);
   const out = data.channels.map((ch) => {
@@ -787,6 +869,7 @@ export function applyRangeEffect(data: AudioData, effect: RangeEffect): RangeRes
       }
     }
   }
+  onProgress?.(1, `Applied ${effect.type}`);
   return { data: audioData(out, rate), tailSeconds };
 }
 
@@ -838,10 +921,14 @@ export function processVoiceOnly(
   // Pitch is always shifted in the frequency domain with the tempo untouched.
   // A speed-changing resample is deliberately not offered, so the
   // `preserveTempo` flag can no longer turn the vocal into a sped-up take.
+  const report = options.onProgress ?? (() => undefined);
+  report(0, options.semitones === 0 ? 'Preparing vocal stem' : 'Shifting vocal stem');
   let processed: AudioData = options.semitones === 0
     ? cloneAudio(vocalStem)
-    : pitchShift(vocalStem, options.semitones, options.onProgress);
+    : pitchShift(vocalStem, options.semitones, (value, message) => report(value * 0.9, message));
+  report(0.9, 'Matching vocal level');
   processed = applyGain(processed, options.vocalVolume);
+  report(0.95, options.mixWithAccompaniment ? 'Mixing with accompaniment' : 'Finishing');
   const length = original.length;
   const channelCount = Math.max(original.channels.length, processed.channels.length);
   const out = Array.from({ length: channelCount }, () => new Float32Array(length));
@@ -855,5 +942,6 @@ export function processVoiceOnly(
     const source = processed.channels[Math.min(c, processed.channels.length - 1)];
     for (let i = 0; i < length; i++) out[c][i] += source[i] ?? 0;
   }
+  report(1, 'Vocal processing complete');
   return audioData(out, original.sampleRate);
 }

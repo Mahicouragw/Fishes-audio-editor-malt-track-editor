@@ -71,6 +71,8 @@ export interface PrepareClipOptions {
   onProgress?: ProgressFn;
   /** Test hook: override where clip/stem audio is loaded from. */
   load?: (assetId: string) => Promise<AudioData>;
+  /** Cancel a long render (human-voice processing can take a while). */
+  signal?: AbortSignal;
 }
 
 /**
@@ -103,17 +105,18 @@ export async function prepareClipData(track: Track, clip: Clip, options: Prepare
         },
       },
       options.onProgress,
+      { signal: options.signal },
     );
     if (!result.data) throw new Error('Vocal processing produced no audio');
     out = result.data;
   } else {
     out = semis !== 0
-      ? (await runDspJob({ kind: 'pitch', data, semitones: semis }, options.onProgress)).data ?? cloneAudio(data)
+      ? (await runDspJob({ kind: 'pitch', data, semitones: semis }, options.onProgress, { signal: options.signal })).data ?? cloneAudio(data)
       : cloneAudio(data);
   }
   for (const effect of clip.effects) {
     if (!effect.enabled) continue;
-    const result = await runDspJob({ kind: 'range', data: out, effect }, options.onProgress);
+    const result = await runDspJob({ kind: 'range', data: out, effect }, options.onProgress, { signal: options.signal });
     if (!result.data) throw new Error(`Effect ${effect.type} produced no audio`);
     out = result.data;
   }
