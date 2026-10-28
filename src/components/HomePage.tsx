@@ -172,6 +172,11 @@ export function HomePage({ store, onOpenStudio }: { store: ProjectStore; onOpenS
           )}
         </section>
       </div>
+      {/* The commit this bundle was built from. A cached old bundle behaves
+          exactly like a bug that was never fixed; this makes it visible. */}
+      <p className="hint" aria-live="off" aria-label={`Running build ${__BUILD_ID__}`}>
+        build {__BUILD_ID__}
+      </p>
     </div>
   );
 }
