@@ -166,9 +166,16 @@ function normaliseOverlapAdd(
  */
 export function separateVocalsLocal(input: AudioData, onProgress?: ProgressFn): SeparationResult {
   if (!input.channels.length || input.length === 0) throw new Error('No audio to separate');
+  // The very first thing that happens must be a progress event: the down-sample
+  // below takes seconds on a long song, and a bar that sits at 0 % while work
+  // is happening is indistinguishable from a frozen page.
+  onProgress?.(0, 'Preparing the analyser');
+
   const originalRate = input.sampleRate;
   const workingRate = Math.min(originalRate, 22050);
-  const working = resampleAudio(input, workingRate);
+  const working = resampleAudio(input, workingRate, (progress, message) => {
+    onProgress?.(0.01 + progress * 0.09, progress >= 1 ? 'Analysing spectral content' : `Preparing the analyser — ${message}`);
+  });
   const isStereo = working.channels.length >= 2;
   const frames = Math.max(1, Math.floor((working.length - N) / HOP) + 1);
   const window = new Float64Array(N);
@@ -182,7 +189,7 @@ export function separateVocalsLocal(input: AudioData, onProgress?: ProgressFn): 
   // song are enough: the background estimate is a low percentile per bin, and
   // sampling cannot bias it towards one section of the track.
   // ---------------------------------------------------------------------
-  onProgress?.(0, 'Analysing spectral content');
+  onProgress?.(0.1, 'Analysing spectral content');
   const sampleCount = Math.min(frames, 64);
   const sampled: Float64Array[] = [];
   for (let i = 0; i < sampleCount; i++) {
@@ -195,33 +202,28 @@ export function separateVocalsLocal(input: AudioData, onProgress?: ProgressFn): 
     background[k] = values[Math.min(values.length - 1, Math.max(0, Math.floor(values.length * 0.15)))] ?? 0;
   }
   sampled.length = 0;
-  onProgress?.(0.1, 'Estimating vocal mask');
+  onProgress?.(0.12, 'Estimating vocal mask');
 
   // ---------------------------------------------------------------------
-  // Pass 2 — mask each frame and overlap-add it straight away. The mask needs
-  // one frame of look-ahead on each side (the 3-frame smoothing), so a small
-  // ring buffer holds the pending masks. The output of frame f is written once
-  // all three contributing masks are known.
+  // Pass 2 — one frame at a time. The mask needs the frame before and after it
+  // (the 3-frame smoothing), so a three-entry ring holds the pending frames and
+  // frame f is written once frame f+1 is known. Memory stays at a few hundred
+  // kilobytes: the previous version cached magnitude *and* phase for every
+  // frame of every channel (~150 MB for a 3:32 song, enough for a tablet
+  // browser to kill the worker).
   // ---------------------------------------------------------------------
   const outputs = working.channels.map(() => new Float32Array(working.length));
   const windowSums = working.channels.map(() => new Float32Array(working.length));
-  // Frame-tagged analyses: the frame that gets written must be the one the mask
-  // was smoothed around, not simply the oldest one still pending.
-  const analyses: Array<Array<{ frame: number; analysis: FrameAnalysis }>> = working.channels.map(() => []);
 
   let coherenceSum = 0;
   let maskSum = 0;
   let maskSquared = 0;
   let cells = 0;
 
-  /** Compute the raw (unsmoothed) mask for one frame, for every channel. */
-  const rawMask = (frame: number): Float64Array => {
-    const left = analyseFrame(working.channels[0], frame, window, re, im);
-    const right = isStereo
-      ? analyseFrame(working.channels[1], frame, window, re, im)
-      : left;
-    analyses[0].push({ frame, analysis: left });
-    if (working.channels.length > 1) analyses[1].push({ frame, analysis: right });
+  /** The raw (unsmoothed) vocal mask of one frame. */
+  const rawMask = (analyses: FrameAnalysis[]): Float64Array => {
+    const left = analyses[0];
+    const right = analyses[1] ?? analyses[0];
     const mask = new Float64Array(BINS);
     for (let k = 0; k < BINS; k++) {
       const magnitudeLeft = left.magnitude[k];
@@ -230,6 +232,7 @@ export function separateVocalsLocal(input: AudioData, onProgress?: ProgressFn): 
       const coherence = isStereo
         ? 1 - Math.abs(magnitudeLeft - magnitudeRight) / (magnitudeLeft + magnitudeRight + 1e-8)
         : 0.45;
+      // Mean magnitude of the four neighbouring bins on each side, per channel.
       let local = 0;
       let neighbours = 0;
       for (let j = -4; j <= 4; j++) {
@@ -254,14 +257,13 @@ export function separateVocalsLocal(input: AudioData, onProgress?: ProgressFn): 
     return mask;
   };
 
-  /** 3 frames × 5 bins box smoothing, as the single-frame version did. */
-  const smoothMask = (masks: Float64Array[], index: number): Float64Array => {
+  /** 3 frames × 5 bins box smoothing; a missing neighbour is simply skipped. */
+  const smoothMask = (left: Float64Array | null, centre: Float64Array, right: Float64Array | null): Float64Array => {
     const out = new Float64Array(BINS);
     for (let k = 0; k < BINS; k++) {
       let sum = 0;
       let count = 0;
-      for (let df = -1; df <= 1; df++) {
-        const mask = masks[index + df];
+      for (const mask of [left, centre, right]) {
         if (!mask) continue;
         for (let dk = -2; dk <= 2; dk++) {
           const bin = k + dk;
@@ -276,62 +278,89 @@ export function separateVocalsLocal(input: AudioData, onProgress?: ProgressFn): 
     return out;
   };
 
-  /** Masks still waiting for their right-hand neighbour, oldest first. */
-  const pending: Array<{ frame: number; mask: Float64Array }> = [];
-  const emit = (frame: number) => {
-    // The smoothed mask of `frame` needs frames -1, 0, +1; a neighbour outside
-    // the song is skipped, matching the previous edge behaviour.
-    const masks = pending.slice(0, 3);
-    const centre = masks.findIndex((entry) => entry.frame === frame);
-    const smoothed = smoothMask(masks.map((entry) => entry.mask), Math.max(0, centre));
+  const extract = (
+    analyses: FrameAnalysis[],
+    masks: [Float64Array | null, Float64Array, Float64Array | null],
+    frame: number,
+  ) => {
+    const smoothed = smoothMask(masks[0], masks[1], masks[2]);
     for (let c = 0; c < working.channels.length; c++) {
-      const index = analyses[c].findIndex((entry) => entry.frame === frame);
-      if (index < 0) continue;
-      synthesiseFrame(analyses[c][index].analysis, smoothed, frame, window, outputs[c], windowSums[c], re, im);
-      // Everything older than this frame will never be written.
-      analyses[c].splice(0, index + 1);
+      const analysis = analyses[c] ?? analyses[0];
+      synthesiseFrame(analysis, smoothed, frame, window, outputs[c], windowSums[c], re, im);
     }
-    while (pending.length && pending[0].frame <= frame) pending.shift();
+  };
+
+  // Frames are written strictly in order, one at a time. `nextFrame` is the
+  // first frame whose output has not been written yet; it is written as soon as
+  // the frame after it exists, because the smoothing needs that neighbour. The
+  // ring therefore holds at most three frames: the one being written, the frame
+  // before it and the frame after it.
+  let nextFrame = 0;
+  const ring: Array<{ frame: number; mask: Float64Array; analyses: FrameAnalysis[] }> = [];
+
+  const flush = (allowMissingRight: boolean) => {
+    while (nextFrame < frames) {
+      const index = ring.findIndex((entry) => entry.frame === nextFrame);
+      if (index < 0) return;
+      const hasRight = ring.some((entry) => entry.frame === nextFrame + 1);
+      if (!hasRight && !allowMissingRight) return;
+      const centre = ring[index];
+      const left = ring.find((entry) => entry.frame === nextFrame - 1)?.mask ?? null;
+      const right = ring.find((entry) => entry.frame === nextFrame + 1)?.mask ?? null;
+      extract(centre.analyses, [left, centre.mask, right], nextFrame);
+      // Keep `nextFrame` itself: it is the left neighbour of the next write.
+      for (let i = ring.length - 1; i >= 0; i--) {
+        if (ring[i].frame < nextFrame) ring.splice(i, 1);
+      }
+      nextFrame += 1;
+    }
   };
 
   for (let frame = 0; frame < frames; frame++) {
-    // rawMask() records the analysis for this frame, so the two stay in step.
-    pending.push({ frame, mask: rawMask(frame) });
-    // Frame f-1 can only be written once frame f is known.
-    if (pending.length === 3) emit(frame - 1);
-    if (onProgress && frame % 24 === 0) {
-      onProgress(0.1 + (frame / frames) * 0.8, 'Separating vocals');
+    const analyses = working.channels.map((channel) => analyseFrame(channel, frame, window, re, im));
+    ring.push({ frame, mask: rawMask(analyses), analyses });
+    flush(false);
+    if (onProgress && (frame % 8 === 0 || frame === frames - 1)) {
+      onProgress(0.12 + ((frame + 1) / frames) * 0.74, 'Separating vocals');
     }
   }
-  // Flush the remaining frames (the last one has no right-hand neighbour).
-  while (pending.length) emit(pending[0].frame);
+  // The final frame has no right-hand neighbour.
+  flush(true);
 
   for (let c = 0; c < working.channels.length; c++) {
-    const output = outputs[c];
-    const windowSum = windowSums[c];
-    normaliseOverlapAdd(output, windowSum, N, HOP);
+    normaliseOverlapAdd(outputs[c], windowSums[c], N, HOP);
   }
-
-  const vocalChannels = outputs;
-  const instrumentalChannels = working.channels.map((channel, c) => {
-    const out = new Float32Array(channel.length);
-    for (let i = 0; i < channel.length; i++) out[i] = channel[i] - vocalChannels[c][i];
-    return out;
-  });
-  onProgress?.(0.92, 'Rebuilding stems');
 
   const mean = maskSum / Math.max(1, cells);
   const variance = Math.max(0, maskSquared / Math.max(1, cells) - mean * mean);
   const avgCoherence = coherenceSum / Math.max(1, cells);
   const quality = clamp(0.18 + 0.28 * avgCoherence + 0.35 * Math.sqrt(variance) + (isStereo ? 0.08 : 0), 0, 0.72);
+
+  // ---------------------------------------------------------------------
+  // Pass 3 — back to the original sample rate, then derive the accompaniment by
+  // *subtraction*. The separation itself runs at 22.05 kHz; resampling the
+  // 22.05 kHz difference instead would band-limit the accompaniment to 11 kHz
+  // (audibly dull) and resample twice as much audio. This resamples only the
+  // vocal, so it is also about half the work it used to be.
+  // ---------------------------------------------------------------------
+  onProgress?.(0.86, 'Rebuilding the vocal stem');
+  const vocalAtRate = fitLength(audioData(outputs, workingRate), working.length);
   const vocal = fitLength(
-    resampleAudio(fitLength(audioData(vocalChannels, workingRate), working.length), originalRate),
+    resampleAudio(vocalAtRate, originalRate, (progress) => {
+      onProgress?.(0.86 + progress * 0.13, progress >= 1 ? 'Mixing with the accompaniment' : 'Rebuilding the vocal stem');
+    }),
     input.length,
   );
-  const instrumental = fitLength(
-    resampleAudio(fitLength(audioData(instrumentalChannels, workingRate), working.length), originalRate),
-    input.length,
+  const instrumental = audioData(
+    input.channels.map((channel, c) => {
+      const vocalChannel = vocal.channels[c] ?? vocal.channels[0];
+      const out = new Float32Array(input.length);
+      for (let i = 0; i < input.length; i++) out[i] = channel[i] - (vocalChannel[i] ?? 0);
+      return out;
+    }),
+    originalRate,
   );
+
   const message = `Approximate local isolation ready — estimated confidence ${(quality * 100).toFixed(0)}%.`;
   const warning = isStereo
     ? 'Centred instruments may remain in the vocal stem. This is signal processing, not a trained vocal-separation model.'

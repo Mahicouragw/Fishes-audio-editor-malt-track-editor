@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useElapsed } from './useElapsed';
 import type { HarmonyLayer, RangeEffect, Track } from '../types';
 import { formatTime, parseTime, makeId } from '../types';
 import { describePan } from '../audio/harmony';
@@ -96,15 +97,20 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
   );
 }
 
-export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onSeparate, onPreview, busy, progress, message, onCancel }: {
+export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onSeparate, onPreview, busy, progress, message, disabled = false, onCancel }: {
   track: Track;
   onToggle: (v: boolean) => void; onPitch: (s: number) => void; onVocalVolume: (v: number) => void; onMix: (v: boolean) => void;
   onSeparate: () => void; onPreview: (kind: 'original' | 'vocal' | 'processed') => void;
   busy: boolean; progress: number; message: string;
+  /** Another panel's job is running: disable the controls, show no progress bar. */
+  disabled?: boolean;
   /** Stop a separation that is still running. */
   onCancel: () => void;
 }) {
   const v = track.vocal;
+  // A visible counter proves the page is alive while a long render is still on
+  // its first stage. Not a live region: it would talk over everything else.
+  const elapsed = useElapsed(busy);
   return (
     <section className="panel" aria-label="Human voice processing">
       <h3 className="panel-title">Human Voice Processing</h3>
@@ -112,7 +118,7 @@ export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onS
         type="button" role="switch" aria-checked={v.enabled}
         aria-label={`Human Voice Processing, ${v.enabled ? 'on' : 'off'}`}
         className={`switch ${v.enabled ? 'on' : 'off'}`}
-        disabled={busy}
+        disabled={busy || disabled}
         onClick={() => onToggle(!v.enabled)}
       >
         <span className="switch-track"><span className="switch-thumb" /></span>
@@ -129,8 +135,15 @@ export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onS
       {busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={message}>
           <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
-          <span>{message} {Math.round(progress * 100)}%</span>
+          <span aria-live="off">{message} {Math.round(progress * 100)}% · {elapsed}s</span>
         </div>
+      )}
+      {busy && (
+        <p className="hint" role="note">
+          Separation runs the whole track through a spectral analysis. A 3½-minute song
+          takes roughly a minute on a phone or tablet — the percentage updates as it works
+          and you can cancel at any point.
+        </p>
       )}
       {busy && (
         <button type="button" className="btn btn-xs" aria-label="Cancel vocal separation" onClick={onCancel}>
@@ -138,16 +151,16 @@ export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onS
         </button>
       )}
       <div className="row">
-        <button type="button" className="btn btn-primary" aria-label="Run vocal separation" onClick={onSeparate} disabled={busy}>
+        <button type="button" className="btn btn-primary" aria-label="Run vocal separation" onClick={onSeparate} disabled={busy || disabled}>
           {busy ? `Separating ${Math.round(progress * 100)}%` : 'Run vocal separation'}
         </button>
-        <button type="button" className="btn" aria-label="Preview original track audio" onClick={() => onPreview('original')} disabled={busy}>Original</button>
-        <button type="button" className="btn" aria-label="Preview isolated vocal stem" onClick={() => onPreview('vocal')} disabled={busy || v.status !== 'ready' || !v.vocalAssetId}>Vocal stem</button>
-        <button type="button" className="btn" aria-label="Preview processed vocals mixed with accompaniment" onClick={() => onPreview('processed')} disabled={busy || v.status !== 'ready' || !v.vocalAssetId}>Processed mix</button>
+        <button type="button" className="btn" aria-label="Preview original track audio" onClick={() => onPreview('original')} disabled={busy || disabled}>Original</button>
+        <button type="button" className="btn" aria-label="Preview isolated vocal stem" onClick={() => onPreview('vocal')} disabled={busy || disabled || v.status !== 'ready' || !v.vocalAssetId}>Vocal stem</button>
+        <button type="button" className="btn" aria-label="Preview processed vocals mixed with accompaniment" onClick={() => onPreview('processed')} disabled={busy || disabled || v.status !== 'ready' || !v.vocalAssetId}>Processed mix</button>
       </div>
       <label className="field">
         <span>Vocal pitch: {describeSemis(v.pitchSemis)}</span>
-        <input type="range" min={-12} max={12} step={1} value={v.pitchSemis} aria-label={`Vocal pitch, ${describeSemis(v.pitchSemis)}`} disabled={busy} onChange={(e) => onPitch(Number(e.target.value))} />
+        <input type="range" min={-12} max={12} step={1} value={v.pitchSemis} aria-label={`Vocal pitch, ${describeSemis(v.pitchSemis)}`} disabled={busy || disabled} onChange={(e) => onPitch(Number(e.target.value))} />
       </label>
       {v.enabled && v.status === 'ready' && (
         <p className="hint">
@@ -161,13 +174,13 @@ export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onS
       </p>
       <label className="field">
         <span>Vocal volume: {Math.round(v.vocalVolume * 100)}%</span>
-        <input type="range" min={0} max={2} step={0.01} value={v.vocalVolume} aria-label="Vocal volume, percent" disabled={busy} onChange={(e) => onVocalVolume(Number(e.target.value))} />
+        <input type="range" min={0} max={2} step={0.01} value={v.vocalVolume} aria-label="Vocal volume, percent" disabled={busy || disabled} onChange={(e) => onVocalVolume(Number(e.target.value))} />
       </label>
       <label className="field checkbox">
-        <input type="checkbox" checked={v.mixWithAccompaniment} aria-label="Mix processed vocals with original accompaniment" disabled={busy} onChange={(e) => onMix(e.target.checked)} />
+        <input type="checkbox" checked={v.mixWithAccompaniment} aria-label="Mix processed vocals with original accompaniment" disabled={busy || disabled} onChange={(e) => onMix(e.target.checked)} />
         <span>Mix processed vocals with original accompaniment</span>
       </label>
-      <button type="button" className="btn" aria-label="Restore original audio for this track" onClick={() => { onToggle(false); onPitch(0); }} disabled={busy}>Restore original audio</button>
+      <button type="button" className="btn" aria-label="Restore original audio for this track" onClick={() => { onToggle(false); onPitch(0); }} disabled={busy || disabled}>Restore original audio</button>
       <p className="hint">Local separation is an honest approximation (REPET-style background estimate + stereo-centre + harmonic salience mask). Centred or harmonic instruments can remain in the stem. For studio quality, connect a Demucs server in Settings. This is never presented as an EQ trick.</p>
     </section>
   );
@@ -179,7 +192,7 @@ function clampInt(v: number, min: number, max: number): number {
 
 const RANGE_HARMONY_INTERVALS = [0, 3, 4, 7, -3, -4, -7];
 
-export function RangeEffectsPanel({ duration, selection, clipDuration, onSelection, onPreview, onApply, busy, progress, message }: {
+export function RangeEffectsPanel({ duration, selection, clipDuration, onSelection, onPreview, onApply, busy, progress, message, disabled = false }: {
   duration: number;
   selection: { start: number; end: number } | null;
   /** Resolves the length (seconds) of the clip this panel would act on. */
@@ -190,6 +203,8 @@ export function RangeEffectsPanel({ duration, selection, clipDuration, onSelecti
   busy: boolean;
   progress: number;
   message: string;
+  /** Another panel's job is running: disable the controls, show no progress bar. */
+  disabled?: boolean;
 }) {
   const [start, setStart] = useState(selection?.start ?? 5);
   const [end, setEnd] = useState(selection?.end ?? Math.min(25, duration || 25));
@@ -366,8 +381,8 @@ export function RangeEffectsPanel({ duration, selection, clipDuration, onSelecti
         </div>
       )}
       <div className="row">
-        <button type="button" className="btn btn-primary" aria-label="Apply effect to selected range" disabled={busy} onClick={() => run(true)}>Apply to Selection</button>
-        <button type="button" className="btn" aria-label="Preview effect on selected range without applying" disabled={busy} onClick={() => run(false)}>Preview</button>
+        <button type="button" className="btn btn-primary" aria-label="Apply effect to selected range" disabled={busy || disabled} onClick={() => run(true)}>Apply to Selection</button>
+        <button type="button" className="btn" aria-label="Preview effect on selected range without applying" disabled={busy || disabled} onClick={() => run(false)}>Preview</button>
         <button type="button" className="btn" aria-label="Clear selection" onClick={() => onSelection(null)}>Clear</button>
       </div>
     </section>

@@ -92,3 +92,55 @@ describe('separation', () => {
     expect(new Set(events.map((event) => event.message)).size).toBeGreaterThan(2);
   });
 });
+
+describe('separation progress shape', () => {
+  const sr = 22050;
+  const n = Math.round(sr * 3);
+  const build = () => {
+    const ch = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      ch[i] = 0.3 * Math.sin(2 * Math.PI * 220 * t) + 0.1 * Math.sin(2 * Math.PI * 330 * t);
+    }
+    return ch;
+  };
+
+  it('reports something immediately, before any heavy work', () => {
+    // The down-sample runs before the analysis and used to take seconds with no
+    // event at all: the user saw 0 % and no evidence the job had started.
+    const events: number[] = [];
+    const started = performance.now();
+    const stamps: number[] = [];
+    separateVocalsLocal(audioData([build(), build()], sr), (p) => {
+      events.push(p);
+      stamps.push(performance.now() - started);
+    });
+    expect(events[0]).toBe(0);
+    expect(stamps[0]).toBeLessThan(50);
+  });
+
+  it('never leaves a long gap with no progress event', () => {
+    const stamps: number[] = [];
+    const started = performance.now();
+    separateVocalsLocal(audioData([build(), build()], sr), () => stamps.push(performance.now() - started));
+    const total = stamps[stamps.length - 1];
+    let worst = 0;
+    for (let i = 1; i < stamps.length; i++) worst = Math.max(worst, stamps[i] - stamps[i - 1]);
+    // No single silent stretch may dominate the run, and every phase reports.
+    expect(worst).toBeLessThan(Math.max(400, total * 0.5));
+  });
+
+  it('gives the accompaniment its full bandwidth instead of a band-limited copy', () => {
+    // The accompaniment is the input minus the vocal, not a 22.05 kHz
+    // difference resampled back up, so high frequencies stay intact.
+    const input = audioData([build(), build()], sr);
+    const result = separateVocalsLocal(input);
+    let worst = 0;
+    for (let c = 0; c < 2; c++) {
+      for (let i = 0; i < input.length; i++) {
+        worst = Math.max(worst, Math.abs(result.vocal.channels[c][i] + result.instrumental.channels[c][i] - input.channels[c][i]));
+      }
+    }
+    expect(worst).toBeLessThan(1e-6);
+  });
+});

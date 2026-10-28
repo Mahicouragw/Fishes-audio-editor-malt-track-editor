@@ -64,6 +64,8 @@ export interface HarmonizationPanelProps {
   busy: boolean;
   progress: number;
   message: string;
+  /** Another panel's job is running: disable the controls, show no progress bar. */
+  disabled?: boolean;
   error: string;
   canUndo: boolean;
   canRedo: boolean;
@@ -102,6 +104,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
     tracks, harmonies, sourceTrackId, onSourceTrackChange, mediaDuration, hasVocalStems, onRunSeparation,
     ranges, onAddRange, onUpdateRange, onRemoveRange, songKey, scale, onKeyChange, onScaleChange,
     activeGroupId, onCompare, onSoloHarmony, busy, progress, message, error, canUndo, canRedo, onUndo, onRedo,
+    disabled = false,
     previewPlaying, previewPaused, onPausePreview, onResumePreview, onStopPreview,
   } = props;
 
@@ -373,7 +376,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
               className="btn btn-xs"
               aria-label={`${preset.label}. ${preset.description}`}
               onClick={() => loadPreset(preset)}
-              disabled={busy}
+              disabled={busy || disabled}
             >
               {preset.id === 'preset-a' ? 'Preset A — Major (0, +4, +7, +0)' : preset.id === 'preset-b' ? 'Preset B — Alternative (0, +3, +7, +0)' : 'Preset C — Double-tracking'}
             </button>
@@ -455,7 +458,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
                     type="checkbox"
                     checked={voice.enabled}
                     aria-label={`Enable harmony voice ${index + 1}, ${label}`}
-                    disabled={busy}
+                    disabled={busy || disabled}
                     onChange={(e) => updateVoice(voice.id, { enabled: e.target.checked })}
                   />
                   <span>{autoName} · {label}</span>
@@ -470,7 +473,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
                       className="btn btn-xs"
                       aria-label={`De-correlate copy ${index + 1} by detuning it six cents`}
                       onClick={() => updateVoice(voice.id, { detuneCents: -6 })}
-                      disabled={busy}
+                      disabled={busy || disabled}
                     >
                       De-correlate (−6 cents)
                     </button>
@@ -487,7 +490,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
                     step={1}
                     value={voice.semitones}
                     aria-label={`Harmony voice ${index + 1} pitch, ${voice.semitones >= 0 ? 'plus' : 'minus'} ${Math.abs(voice.semitones)} semitones`}
-                    disabled={busy}
+                    disabled={busy || disabled}
                     onChange={(e) => updateVoice(voice.id, { semitones: Math.max(-24, Math.min(24, Math.round(Number(e.target.value) || 0))) })}
                     style={{ width: 72 }}
                   />
@@ -501,7 +504,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
                     step={1}
                     value={voice.detuneCents}
                     aria-label={`Harmony voice ${index + 1} detune, ${voice.detuneCents} cents`}
-                    disabled={busy}
+                    disabled={busy || disabled}
                     onChange={(e) => updateVoice(voice.id, { detuneCents: Math.max(-50, Math.min(50, Number(e.target.value) || 0)) })}
                     style={{ width: 72 }}
                   />
@@ -515,7 +518,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
                     step={1}
                     value={Math.round(voice.offsetSeconds * 1000)}
                     aria-label={`Harmony voice ${index + 1} delay, ${describeDelay(voice.offsetSeconds)}`}
-                    disabled={busy}
+                    disabled={busy || disabled}
                     onChange={(e) => updateVoice(voice.id, { offsetSeconds: Math.max(0, Math.min(500, Number(e.target.value) || 0)) / 1000 })}
                     style={{ width: 72 }}
                   />
@@ -529,7 +532,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
                     step={0.01}
                     value={voice.gain}
                     aria-label={`Harmony voice ${index + 1} volume, ${Math.round(voice.gain * 100)} percent`}
-                    disabled={busy}
+                    disabled={busy || disabled}
                     onChange={(e) => updateVoice(voice.id, { gain: Number(e.target.value) })}
                     style={{ width: 80 }}
                   />
@@ -543,7 +546,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
                     step={0.01}
                     value={voice.pan}
                     aria-label={`Harmony voice ${index + 1} pan, ${describePan(voice.pan)}`}
-                    disabled={busy}
+                    disabled={busy || disabled}
                     onChange={(e) => updateVoice(voice.id, { pan: Number(e.target.value) })}
                     style={{ width: 80 }}
                   />
@@ -551,7 +554,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
                 <select
                   aria-label={`Harmony voice ${index + 1} target track`}
                   value={voice.targetTrackName}
-                  disabled={busy}
+                  disabled={busy || disabled}
                   onChange={(e) => updateVoice(voice.id, { targetTrackName: e.target.value })}
                 >
                   <option value="">{autoName} (auto)</option>
@@ -564,7 +567,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
                     className="btn btn-xs btn-danger"
                     aria-label={`Remove harmony voice ${index + 1}`}
                     onClick={() => removeVoice(voice.id)}
-                    disabled={busy}
+                    disabled={busy || disabled}
                   >
                     Remove
                   </button>
@@ -575,7 +578,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
         })}
       </ul>
 
-      <button type="button" className="btn btn-xs" aria-label="Add harmony voice" onClick={addVoice} disabled={busy}>+ Add voice</button>
+      <button type="button" className="btn btn-xs" aria-label="Add harmony voice" onClick={addVoice} disabled={busy || disabled}>+ Add voice</button>
 
       <label className="field checkbox">
         <input
@@ -593,7 +596,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
         </span>
       </label>
       {!hasVocalStems && (
-        <button type="button" className="btn btn-xs" aria-label="Run vocal separation for the source track" onClick={onRunSeparation} disabled={busy}>
+        <button type="button" className="btn btn-xs" aria-label="Run vocal separation for the source track" onClick={onRunSeparation} disabled={busy || disabled}>
           Run vocal separation
         </button>
       )}
@@ -616,7 +619,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
           type="checkbox"
           checked={separateOriginalTrack}
           aria-label="Create a separate track for the original plus zero voice"
-          disabled={busy}
+          disabled={busy || disabled}
           onChange={(e) => setSeparateOriginalTrack(e.target.checked)}
         />
         <span>Create a separate track for the original (+0) voice instead of reusing the source audio</span>
@@ -632,12 +635,12 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
       )}
 
       <div className="row wrap">
-        <button type="button" className="btn" aria-label="Preview harmony" onClick={() => run(false)} disabled={busy}>Preview</button>
-        <button type="button" className="btn btn-primary" aria-label="Apply harmony" onClick={() => run(true)} disabled={busy}>Apply</button>
+        <button type="button" className="btn" aria-label="Preview harmony" onClick={() => run(false)} disabled={busy || disabled}>Preview</button>
+        <button type="button" className="btn btn-primary" aria-label="Apply harmony" onClick={() => run(true)} disabled={busy || disabled}>Apply</button>
         {/* Cancel stays enabled while a render is running: it stops the job
             instead of leaving the panel busy until the page is reloaded. */}
         <button type="button" className="btn" aria-label="Cancel harmony" onClick={props.onCancel}>Cancel</button>
-        <button type="button" className="btn" aria-label="Reset harmony to original pitch" onClick={resetToOriginal} disabled={busy}>Reset to original pitch</button>
+        <button type="button" className="btn" aria-label="Reset harmony to original pitch" onClick={resetToOriginal} disabled={busy || disabled}>Reset to original pitch</button>
         <button type="button" className="btn" aria-label="Undo last edit" onClick={onUndo} disabled={!canUndo || busy}>Undo</button>
         <button type="button" className="btn" aria-label="Redo last undone edit" onClick={onRedo} disabled={!canRedo || busy}>Redo</button>
       </div>
@@ -696,7 +699,7 @@ export function HarmonizationPanel(props: HarmonizationPanelProps) {
               layer={layer}
               index={index}
               trackName={trackName}
-              busy={busy}
+              busy={busy || disabled}
               onPatch={props.onLayerPatch}
               onOffset={props.onLayerOffset}
               onPreview={props.onLayerPreview}

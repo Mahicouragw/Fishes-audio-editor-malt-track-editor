@@ -6,6 +6,30 @@ import { terminateSharedWorker } from './sharedWorker';
 
 export { terminateSharedWorker as terminateAudioWorker };
 
+/**
+ * A first message per job kind. The hook used to start every job with the word
+ * "Starting", so a long render showed "Starting 0 %" until its first internal
+ * stage reported — which is exactly what a frozen page looks like.
+ */
+const JOB_LABELS: Record<WorkerJob['kind'], string> = {
+  range: 'Applying effect',
+  reverb: 'Rendering reverb',
+  echo: 'Rendering echo',
+  eq: 'Applying equaliser',
+  gain: 'Applying gain',
+  noiseReduction: 'Reducing noise',
+  separate: 'Preparing vocal separation',
+  detectSilence: 'Analysing silence',
+  removeSilence: 'Removing silence',
+  merge: 'Merging audio',
+  voiceOnly: 'Processing the vocal stem',
+  harmonyVoice: 'Rendering harmony voice',
+  pitch: 'Shifting pitch',
+  timeStretch: 'Stretching time',
+  resample: 'Resampling',
+  decodeWav: 'Decoding audio',
+};
+
 export interface DspState {
   busy: boolean;
   progress: number;
@@ -31,7 +55,7 @@ export function useDsp() {
     const token = ++tokenRef.current;
     setBusy(true);
     setProgress(0);
-    setMessage('Starting');
+    setMessage(JOB_LABELS[request.kind] ?? 'Processing audio');
     try {
       const outcome = await runDspJob(request, (p, m) => {
         if (token === tokenRef.current) {

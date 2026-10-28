@@ -113,9 +113,9 @@ export function resampleByRatio(data: AudioData, ratio: number, onProgress?: Pro
   return audioData(out, data.sampleRate);
 }
 
-export function resampleAudio(data: AudioData, targetRate: number): AudioData {
+export function resampleAudio(data: AudioData, targetRate: number, onProgress?: ProgressFn): AudioData {
   if (data.sampleRate === targetRate) return cloneAudio(data);
-  const resampled = resampleByRatio(data, targetRate / data.sampleRate);
+  const resampled = resampleByRatio(data, targetRate / data.sampleRate, onProgress);
   return audioData(resampled.channels, targetRate);
 }
 

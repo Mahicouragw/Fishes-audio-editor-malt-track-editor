@@ -3,6 +3,7 @@ import type { ProjectStore } from '../store/projectStore';
 import { Transport } from './Transport';
 import { Timeline } from './Timeline';
 import { TrackControls, VocalPanel, RangeEffectsPanel } from './EffectsPanel';
+import { useElapsed } from './useElapsed';
 import { HarmonizationPanel, type HarmonyDraft, type HarmonyDraftVoice } from './HarmonizationPanel';
 import { RecordPanel } from './RecordPanel';
 import { SilencePanel } from './SilencePanel';
@@ -101,6 +102,13 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const sepAbortRef = useRef<AbortController | null>(null);
   /** Progress of vocal separation, including the network stages of a server. */
   const [sepRun, setSepRun] = useState({ busy: false, progress: 0, message: '' });
+  /**
+   * Progress of the range-effect job *this panel* started. The shared dsp state
+   * used to drive every panel's progress bar, so turning on Human Voice
+   * Processing also made the range-effect panel display "Starting 0 %" for work
+   * the user never started.
+   */
+  const [rangeRun, setRangeRun] = useState({ busy: false, progress: 0, message: '' });
   const engineRef = useRef<PlaybackEngine | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const preparedRef = useRef(new Map<string, Prepared>());
@@ -109,6 +117,8 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const fallbackAnnouncedRef = useRef<Set<string>>(new Set());
 
   const dsp = useDsp();
+  /** How long the current DSP job has been running (shown so a slow device is visibly working). */
+  const dspElapsed = useElapsed(dsp.busy);
   const project = store.project;
   const selectedTrack = project.tracks.find((t) => t.id === project.selectedTrackId) ?? project.tracks[0] ?? null;
 
@@ -588,6 +598,14 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     }
   }, [selectedTrack, store, dsp]);
 
+  /** Stop whatever playback/export preparation is running. */
+  const cancelPreparation = useCallback(() => {
+    prepAbortRef.current?.abort();
+    prepTokenRef.current += 1;
+    setPrep({ busy: false, progress: 0, message: '' });
+    store.announce('Audio processing cancelled');
+  }, [store]);
+
   const cancelSeparation = useCallback(() => {
     // Aborts the worker (which is the only way to stop a synchronous DSP loop)
     // and any in-flight server request.
@@ -1004,7 +1022,16 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     const clipSeconds = data.length / data.sampleRate;
     if (effect.start >= effect.end) throw new Error('Start time must be earlier than end time');
     if (effect.start < 0 || effect.end > clipSeconds + 0.001) throw new Error(`Selection must be inside this clip (0 to ${formatTime(clipSeconds)})`);
-    const outcome = await dsp.run({ kind: 'range', data, effect });
+    setRangeRun({ busy: true, progress: 0, message: `Preparing ${effect.type}` });
+    let outcome;
+    try {
+      outcome = await dsp.run(
+        { kind: 'range', data, effect },
+        { onProgress: (progress, message) => setRangeRun({ busy: true, progress, message }) },
+      );
+    } finally {
+      setRangeRun({ busy: false, progress: 0, message: '' });
+    }
     if (!outcome.data) throw new Error('Effect produced no audio');
     if (!apply) {
       await playPreview(`${effect.type} on selected range (preview, not applied)`, outcome.data);
@@ -1057,6 +1084,9 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
               forever, which is what stopped the cursor from moving during
               playback. The transport's own time field reads on demand. */}
           <span className="hint" aria-live="off">{formatTime(position)} / {formatTime(duration)}</span>
+          {/* Which bundle this device actually loaded: a stale cache otherwise
+              looks exactly like a bug that was never fixed. */}
+          <span className="hint" aria-live="off" title="Build of the running bundle" aria-label={`Running build ${__BUILD_ID__}`}>build {__BUILD_ID__}</span>
         </div>
       </header>
 
@@ -1079,12 +1109,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             type="button"
             className="btn"
             aria-label="Cancel audio processing"
-            onClick={() => {
-              prepAbortRef.current?.abort();
-              prepTokenRef.current += 1;
-              setPrep({ busy: false, progress: 0, message: '' });
-              store.announce('Audio processing cancelled');
-            }}
+            onClick={cancelPreparation}
           >
             Cancel
           </button>
@@ -1094,7 +1119,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       {dsp.busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(dsp.progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={dsp.message}>
           <div className="progress-bar" style={{ width: `${dsp.progress * 100}%` }} />
-          <span>{dsp.message} {Math.round(dsp.progress * 100)}%</span>
+          <span aria-live="off">{dsp.message} {Math.round(dsp.progress * 100)}% · {dspElapsed}s</span>
         </div>
       )}
 
@@ -1163,10 +1188,11 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                     onMix={(v) => store.setVocalState(selectedTrack.id, { mixWithAccompaniment: v })}
                     onSeparate={handleSeparate}
                     onPreview={handlePreview}
-                    busy={sepRun.busy || dsp.busy}
-                    progress={sepRun.busy ? sepRun.progress : dsp.progress}
-                    message={sepRun.busy ? sepRun.message : dsp.message}
-                    onCancel={cancelSeparation}
+                    busy={sepRun.busy || prep.busy}
+                    disabled={rangeRun.busy || harmonyProgress.busy}
+                    progress={sepRun.busy ? sepRun.progress : prep.progress}
+                    message={sepRun.busy ? sepRun.message : prep.message}
+                    onCancel={() => (sepRun.busy ? cancelSeparation() : cancelPreparation())}
                   />
                 </>
               )}
@@ -1209,7 +1235,8 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                 onSoloHarmony={() => {
                   if (appliedGroupId) store.setHarmonyGroupSolo(appliedGroupId, true);
                 }}
-                busy={harmonyProgress.busy || dsp.busy}
+                busy={harmonyProgress.busy}
+                disabled={sepRun.busy || prep.busy || rangeRun.busy || dsp.busy}
                 progress={harmonyProgress.progress}
                 message={harmonyProgress.message}
                 error={harmonyError}
@@ -1239,7 +1266,10 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                 onSelection={store.setSelection}
                 onPreview={handleRangePreview}
                 onApply={handleRangeApply}
-                busy={dsp.busy} progress={dsp.progress} message={dsp.message}
+                busy={rangeRun.busy}
+                disabled={sepRun.busy || prep.busy || harmonyProgress.busy}
+                progress={rangeRun.progress}
+                message={rangeRun.message}
               />
             </>
           )}
