@@ -1,7 +1,7 @@
 import type { Project, AppSettings, StoredAsset } from '../types';
 
 const DB_NAME = 'wishes-audio-editor';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -12,6 +12,7 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains('assets')) db.createObjectStore('assets', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('recent')) db.createObjectStore('recent', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('history')) db.createObjectStore('history', { keyPath: 'id' });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -98,6 +99,30 @@ export async function deleteAssetsForProject(project: Project): Promise<void> {
   }
 }
 
+/**
+ * Undo/redo stacks are persisted per project so history survives a save and a
+ * reopen. They live in their own store: autosaving a project must not have to
+ * rewrite dozens of project snapshots on every slider move.
+ */
+export interface StoredHistory {
+  id: string;
+  past: Project[];
+  future: Project[];
+}
+
+export async function saveHistory(id: string, past: Project[], future: Project[]): Promise<void> {
+  await transaction('history', 'readwrite', (s) => s.put({ id, past, future }));
+}
+
+export async function getHistory(id: string): Promise<{ past: Project[]; future: Project[] } | null> {
+  const found = await transaction<StoredHistory>('history', 'readonly', (s) => s.get(id));
+  return found ? { past: found.past ?? [], future: found.future ?? [] } : null;
+}
+
+export async function deleteHistory(id: string): Promise<void> {
+  await transaction('history', 'readwrite', (s) => s.delete(id));
+}
+
 export async function saveSettings(settings: AppSettings): Promise<void> {
   await transaction('settings', 'readwrite', (s) => s.put({ id: 'app', ...settings }));
 }
@@ -120,11 +145,12 @@ export async function storageEstimate(): Promise<{ usage: number; quota: number 
 export async function clearAll(): Promise<void> {
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(['projects', 'assets', 'settings', 'recent'], 'readwrite');
+    const tx = db.transaction(['projects', 'assets', 'settings', 'recent', 'history'], 'readwrite');
     tx.objectStore('projects').clear();
     tx.objectStore('assets').clear();
     tx.objectStore('settings').clear();
     tx.objectStore('recent').clear();
+    tx.objectStore('history').clear();
     tx.oncomplete = () => { db.close(); resolve(); };
     tx.onerror = () => reject(tx.error);
   });

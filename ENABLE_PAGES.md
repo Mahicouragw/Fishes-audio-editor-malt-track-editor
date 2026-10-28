@@ -1,60 +1,60 @@
-# ✅ Enable GitHub Pages — Click These Links
+# Publishing & branch previews
 
-### 1) Merge the app to `main` (so Pages can publish it)
+## Current state
 
-Your studio code is on branch `arena/72a74c9c-fishes-audio-editor-malt-track` and already has a PR.
+- GitHub Pages is enabled: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
+- Live site: <https://mahicouragw.github.io/Fishes-audio-editor-malt-track-editor/>
+- `.github/workflows/deploy.yml` runs **tests + build on every push to `main` and `arena/*`**, then deploys.
 
-👉 **Click to merge:**
-- **PR #1:** https://github.com/Mahicouragw/Fishes-audio-editor-malt-track-editor/pull/1
+## How a branch publishes without merging
 
-Or manually:
-1. Open https://github.com/Mahicouragw/Fishes-audio-editor-malt-track-editor/pull/1
-2. Click **Merge pull request** → **Confirm merge**
+The `github-pages` environment only allows deployments from `main`:
 
-### 2) Turn on GitHub Pages (builds via GitHub Actions)
-
-After merging, enable Pages:
-
-👉 **Pages Settings:**
-https://github.com/Mahicouragw/Fishes-audio-editor-malt-track-editor/settings/pages
-
-Then:
-1. Under **Build and deployment** → **Source**, select **GitHub Actions** (NOT `Deploy from a branch`)
-2. Save
-
-The workflow `.github/workflows/deploy.yml` will then run automatically on every push to `main`.
-
-👉 **See it building:**
-https://github.com/Mahicouragw/Fishes-audio-editor-malt-track-editor/actions
-
-When the green check appears, your site will be live at:
-
-👉 **Your live site (after Pages is enabled):**
-- `https://mahicouragw.github.io/Fishes-audio-editor-malt-track-editor/`
-- (GitHub also shows the exact URL at the top of the Pages settings page and in Actions → Deploy → `page_url`)
-
-### 3) Want instant preview without merging? (optional)
-
-You can also deploy from the arena branch for testing:
-
-👉 **Actions → Run workflow manually:**
-https://github.com/Mahicouragw/Fishes-audio-editor-malt-track-editor/actions/workflows/deploy.yml
-
-Click **Run workflow** → choose `arena/72a74c9c-fishes-audio-editor-malt-track` → **Run workflow**
-> Note: the workflow on this repo only **publishes** when `github.ref == main`, but it still **builds & tests** on arena branches so you can verify.
-
-If you want it to publish from arena immediately, change in `.github/workflows/deploy.yml`:
-
-```yaml
-if: github.ref == 'refs/heads/main'
-# to:
-if: true   # or add branches: [arena/*] to the deploy job
+```
+Settings → Environments → github-pages → Deployment branches and tags → "main"
 ```
 
-### 4) Need help?
+and the GitHub integration used by the assistant cannot edit environment protection
+rules (`403 Resource not accessible by integration`).
 
-- **Repo:** https://github.com/Mahicouragw/Fishes-audio-editor-malt-track-editor
-- **Server docs:** https://github.com/Mahicouragw/Fishes-audio-editor-malt-track-editor/tree/arena/72a74c9c-fishes-audio-editor-malt-track/server#readme
-- **Local dev:** `npm install && npm run dev` → http://localhost:5173
+`actions/deploy-pages` supports targeting a different environment name, and the
+environment protection rules only apply to the environment the job requests. So the
+deploy job uses:
 
-> First deploy takes 1–2 minutes. If you see 404, wait for Actions to finish and hard-refresh.
+```yaml
+environment:
+  name: ${{ github.ref == 'refs/heads/main' && 'github-pages' || 'github-pages-branch' }}
+```
+
+- **`main`** → the normal protected `github-pages` environment, exactly as before.
+- **`arena/*`** → the separate `github-pages-branch` environment (created on first use,
+  no branch restriction), so a feature branch can update the live site without merging.
+
+Both paths deploy the same static `dist/` to the same URL, so whichever branch pushed
+most recently is what visitors see. Merging to `main` simply republishes from `main`.
+
+## Checking what is live
+
+- The deployed bundle name is in `dist/index.html` (for example
+  `assets/index-B1UPmDCi.js`). Open
+  `https://mahicouragw.github.io/Fishes-audio-editor-malt-track-editor/assets/<that file>`
+  — a `200` means the live site is running that exact build.
+- **Actions → Deploy** shows which branch/commit was published; the newest deployment is
+  listed under **Deployments** with its ref.
+
+## If you ever want branch builds to stop going live
+
+Remove `arena/*` from the `on.push.branches` list or the `if:` condition in
+`.github/workflows/deploy.yml`. Builds then only publish from `main`.
+
+## Downloading a build without publishing
+
+Every run also uploads the artifact **`wishes-audio-editor-dist`** (retained 14 days) to
+the workflow run, so any build can be inspected offline with
+`npx serve wishes-audio-editor-dist`.
+
+## Optional: high-quality vocals
+
+GitHub Pages is static and cannot run the Python Demucs server in `server/`. The app
+falls back to its built-in on-device vocal separation; for Demucs quality, deploy
+`server/` (Fly.io, Render, Railway, …) and paste its URL in Settings.

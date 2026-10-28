@@ -2,16 +2,21 @@
 
 A browser-first, accessible, multitrack audio editor that runs entirely in your browser. No fake waveforms or placeholder exports — every control does real work.
 
-**Live demo:** enable GitHub Pages for the `main` branch (or deploy `dist/` to any static host). The app is a static Vite site with no required server.
+**Live demo:** <https://mahicouragw.github.io/Fishes-audio-editor-malt-track-editor/> — published by GitHub Actions. Pushes to `main` and to `arena/*` work branches both publish; see `ENABLE_PAGES.md`.
 
 ## What it does
 
 - **Home:** Upload Audio (WAV, MP3, M4A/AAC, OGG, FLAC where the browser decoder supports them), Upload Video (MP4/WebM) with real audio extraction, Merge Audio, Remove Silence, Multitrack Editor, Record Voice, Karaoke Recording, Open Recent Project.
 - **Multitrack Studio:** Voice 1–4 + unlimited tracks, rename/select/duplicate/delete/mute/solo/volume, numeric start/duration fields (no drag-only editing), zoom, synchronized playback with a single Web Audio clock, undo/redo, autosave to IndexedDB.
-- **Transport:** Play/Pause/Stop/Skip backward/forward (configurable, default 5s)/Seek/Restart with clamping and proper cleanup on close.
-- **Pitch (tempo preserved):** Real phase-vocoder pitch shifting per track, -24 to +24 semitones, tested at -12/-3/0/+3/+4/+7/+12. Zero is bit-exact. Volume/sample-rate/duration/stereo are preserved.
-- **Human Voice Processing:** Real ON/OFF toggle, local approximate separation (STFT + REPET + stereo + harmonic cues) with quality/warning, vocal/instrumental stems, vocal-only pitch (tempo-preserved or resample), volume, mix, restore. Not a simple EQ/filter — and it says so.
-- **Harmony:** Real processed layers (e.g., +3/+4/+7/-3/-4/-7 plus custom -24…+24), per-layer mute/duplicate/remove, optional vocals-only.
+- **Transport:** Play/Pause/Resume/Stop/Skip backward/forward (configurable, default 5s)/Seek/Restart. Pause stops the audio at the exact sample and keeps the playhead; Resume continues from it. Rapid repeated presses cannot start a second playback, and the harmonization panel has its own Pause/Resume/Stop preview controls next to the Preview button.
+- **Pitch (tempo preserved, formant preserved):** Real spectral pitch shifting per track, -24 to +24 semitones, tested at -12/-3/0/+3/+4/+7/+12. **Formants stay at the singer's frequencies** — the shifter never resamples the dry signal, it measures the singer's envelope *per frame*, restores it after the resample and keeps the natural high-frequency roll-off. The **+7** voice now matches the source's high-frequency balance within 2.4 dB (it was 32 dB too bright with a plain resampler and 18 dB too bright with the old clamped correction). Zero semitones is bit-exact; duration, sample rate and stereo balance are preserved, attack transients are kept, and the level is matched frame by frame. See `HARMONIZATION.md` for the measurements.
+- **Human Voice Processing:** Real ON/OFF toggle. Turning it ON runs the actual separator (local approximate: STFT + REPET-style background estimate + stereo-centre + harmonic-salience mask, or a connected Demucs server), then pitch-shifts **only** the isolated vocal (tempo preserved) and mixes it back with the untouched accompaniment; the original asset is never modified, so A/B comparison is always possible. Turning it OFF uses ordinary whole-track processing. It reports real confidence and the limits of the method — this is never presented as a filter or a checkbox.
+- **Harmonization:** Three editable presets — **A: +0/0 ms/100 %, +4/23 ms/30 %, +7/49 ms/40 %, +0/33 ms/30 %**; **B: +0/0/100 %, +3/23/30 %, +7/19/40 %, +0/5/30 %**; **C: natural double-tracking**, four +0 voices at 0/12/24/36 ms and 100/30/25/20 %.** Every pitch, cent-detune, delay, volume, pan, target track and effect is editable. Applying renders real audio onto tracks created on demand, as one undoable step. The **+0 lead reuses the source audio** (bit-identical) and each +0 *double* is micro-detuned so it cannot comb-filter the lead. Applied voices can be previewed, muted, soloed, panned, delayed, gain-adjusted, re-rendered with reverb/echo, duplicated and removed.
+- **Per-track stereo pan:** L / C / R buttons plus a fine −100…+100 slider with spoken labels, applied with a constant-power law in **both** live playback and the exported file. Resolution order is harmony-layer pan → clip pan → track pan. Mono exports have no stereo field and say so.
+- **Lead duplicates:** “Duplicate lead (unprocessed)” copies the selected track onto a new track with zero pitch, no effects, no vocal processing and untouched clip timing, ready to be panned or delayed as a double.
+- **A/B listening:** mute all harmony voices to hear the original, restore them, solo the harmony, or compare processed vs original per track.
+- **Harmonization scope:** **Entire Song** processes the complete media duration (a 3:32 song is processed as 212 s, from the first sample to the last). **Selected Time Ranges** accepts any number of non-contiguous ranges (00:05–00:25, 01:25–01:35, 02:25–02:35, 03:10–03:20, …): add, edit, enable/disable and remove each one with numeric time fields, validated against the real decoded duration. Only samples inside enabled ranges are processed — each is rendered with its own context and short edge fades, and everything outside is digital silence, verified sample by sample. Delays never lengthen the song.
+- **Key & scale:** choose the song key and major/minor scale; intervals that fall outside the key are flagged with a concrete suggestion ("+3 is outside C major — suggested +4") and can be snapped, while the lead stays at its original pitch.
 - **Time-range effects:** Numeric Start/End (e.g., 00:05.000–00:25.000), Apply to Selection only, with tail handling: pitch, harmony, reverb, echo/delay, EQ, volume, fade in/out, noise reduction.
 - **Record/Karaoke:** Real `AudioWorklet` PCM capture (ScriptProcessor fallback), device selection, count-in, level meter, headphone monitoring toggle, retake, synchronized playback.
 - **Merge & Silence:** Real sample-accurate merging, gap/overlap, sequential/timeline; real RMS-based silence detection with threshold/min-duration/preserve, preview and selective removal.
@@ -22,7 +27,9 @@ A browser-first, accessible, multitrack audio editor that runs entirely in your 
 ## Architecture
 
 - **Browser-first:** Web Audio for sync, IndexedDB for projects/assets, Web Workers optional for DSP, LAME for MP3.
-- **DSP:** Windowed-sinc resampling, Hann-window phase vocoder (2048-point FFT), biquad EQ, feedback delay, Schroeder reverbs, spectral-gate noise reduction, real WAV encode/decode.
+- **DSP:** Windowed-sinc resampling (a 256-phase kernel table, verified against the direct formula to 1e-4), Hann-window phase vocoder (2048-point FFT) with **identity phase locking** and edge-safe overlap-add normalisation (no end-of-buffer spikes), biquad EQ, feedback delay, Schroeder reverbs, spectral-gate noise reduction, real WAV encode/decode. Every job runs in a Web Worker with a watchdog, real progress reporting, cancellation and a main-thread fallback only when the worker cannot start.
+- **Pitch shifting:** time-stretch → resample → **re-impose the source spectral envelope** (`src/audio/formant.ts`). Tempo and duration are restored exactly, and the formants stay where the singer put them; `formantPreserve: 0` keeps the raw transposition as an honest A/B reference. See `HARMONIZATION.md`.
+- **Mixdown:** one shared constant-power pan law in playback and export, per-frame loudness matching, layer/clip/track pan resolution, layer gain, mute/solo, master fader and a soft limiter.
 - **Vocal separation:** Local approximate (documented) + optional Demucs server (`server/`). See `server/README.md` for setup, `POST /separate`, randomized job IDs, cleanup, and FFmpeg prerequisites.
 
 ## Development
@@ -50,14 +57,38 @@ GitHub Pages cannot run Python — deploy the server to Fly.io/Render/Railway/et
 
 ## Accessibility
 
-Dark charcoal studio theme with purple accents, large transport, keyboard/focus order, semantic buttons, `aria-label`/`aria-pressed`/`aria-selected`/`role=switch`, live announcements, 44px targets, reduced-motion support, no focus-stealing waveforms.
+Dark charcoal studio theme with purple accents, large transport, keyboard/focus order, semantic buttons, `aria-label`/`aria-pressed`/`aria-selected`/`role=switch`, event-based live announcements only, 44px targets, reduced-motion support, no focus-stealing waveforms. The running playhead, progress percentages and the record timer are deliberately **not** live regions: a value that changes many times a second keeps a screen reader talking and blocks cursor navigation.
 
 ## Tests
 
-Automated tests cover decoding/validation, pitch accuracy & tempo preservation, track sync/selection, vocal ON/OFF, harmony intervals, range effects (validation, outside-preservation, tails), recording helpers, save/reopen, merge/silence, export encoding, accessibility labels, and error/large-file handling.
+238 tests across 26 files (`npx vitest run`). The harmonization suite runs against an **actual 3:32 (212 s) stereo WAV file written to disk and read back**:
+
+- Entire Song processes the full 212 s, and the last 10 s really is pitch-shifted (proving the tail is not skipped).
+- Selected-range processing leaves every sample outside the range untouched (bit-identical) or silent for a voice layer, and shifts only inside it.
+- +0 is bit-exact; +3/+4/+7 and -3/-7 land on the expected frequencies with unchanged duration and no level drop.
+- Human Voice Processing changes the vocal pitch while the accompaniment stays within ±10% of its original level; with it OFF the whole track moves.
+- All three presets load their exact pitch/delay/volume values, each voice can be disabled independently, and the +0 lead never allocates duplicate audio.
+- Preset C's doubles add level instead of comb-filtering the lead.
+- Every listed range is shifted independently and the gaps between them are **digitally silent**, with fades at the boundaries.
+- Formant preservation is measured, not claimed: in Presets A and B every voice (+3/+4/+7) follows the *singer's* formant envelope to within 2.7–3.2 dB, while the "the formants moved with the pitch" hypothesis is off by 9.8–14 dB. A plain resample at +7 adds +9.8 dB above 4 kHz and a 1.50× spectral centroid; the shipping shifter adds +1.3 dB and a 0.91× centroid. Pitch lands within 0.01 %, duration is exact and the level stays in 0.7–1.3×.
+- Pan is real: a hard-left exported track leaks < 1e-9 into the right channel, centre is bit-identical, and the live playback graph uses the matching constant-power compensation.
+- Exported WAV bytes, decoded back, contain the real processed sound (not the original pitch).
+- Every DSP job (17 kinds, including human-voice rendering, clip effects and separation) emits a start event at 0 %, live stage messages and a final 100 % — the progress bar cannot sit at 0 % for a whole song again.
+- The worker runner is exercised with a fake worker: a crash, a silent thread and a transfer failure each reject with an actionable message, and cancelling terminates the worker.
+- Separated stems never exceed the input peak (the old overlap-add amplified the buffer edges to 5.4×), the stems reconstruct the input exactly, and separation progress is monotonic on stereo input.
+- Save/reopen preserves every harmony voice's interval, gain, mute, solo, offset, scope, effects, pan, ranges, key/scale and its track arrangement.
+- Undo/redo runs in order across pan, key, preset and range edits, coalesces slider drags, and **the history stacks are restored when a saved project is reopened**.
+- An unprocessed lead duplicate really is unprocessed: zero pitch, zero cents, no effects, same asset and timing.
+- The analyser rejects window sidelobes (a steady tone's envelope no longer dives 30 dB between its harmonics, which was what made the +7 voice metallic) and leaves material without formants (fewer than six partials) uncoloured.
+- Pause is exact: pausing returns the sample the sound stopped at, pushes it to the playhead, and resuming continues from it without walking backwards by the scheduling lead; pressing Play/Resume repeatedly leaves exactly one live source.
+- The transport offers Play → Pause → Resume with the right accessible name at each step, and the running clock, progress percentages and record timer are not live regions, so TalkBack's cursor can move while audio plays.
+
+Also covered: decoding/validation, tempo preservation, track sync/selection, range effects, recording helpers, merge/silence, export encoding, accessibility labels, and error/large-file handling.
+
+The engine's behaviour and limits, including the corrected root cause of the old chipmunk sound, are documented in [`HARMONIZATION.md`](HARMONIZATION.md).
 
 ## Remaining work for you
 
-1. Enable Pages: repo Settings → Pages → Source: GitHub Actions (or push `dist/` to `gh-pages`).
+1. Pages is already enabled (GitHub Actions source) and the live site tracks the latest deploy; see `ENABLE_PAGES.md`.
 2. Optional: deploy `server/` for high-quality Demucs separation and set its URL in the app.
 3. Verify microphone on your target Android tablet with the installed browser build.

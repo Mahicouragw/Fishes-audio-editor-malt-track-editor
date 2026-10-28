@@ -96,7 +96,7 @@ export function HomePage({ store, onOpenStudio }: { store: ProjectStore; onOpenS
         {busy && (
           <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={busy}>
             <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
-            <span aria-live="polite">{busy} {Math.round(progress * 100)}%</span>
+            <span>{busy} {Math.round(progress * 100)}%</span>
           </div>
         )}
         {error && <div className="error" role="alert">{error}</div>}
@@ -172,6 +172,11 @@ export function HomePage({ store, onOpenStudio }: { store: ProjectStore; onOpenS
           )}
         </section>
       </div>
+      {/* The commit this bundle was built from. A cached old bundle behaves
+          exactly like a bug that was never fixed; this makes it visible. */}
+      <p className="hint" aria-live="off" aria-label={`Running build ${__BUILD_ID__}`}>
+        build {__BUILD_ID__}
+      </p>
     </div>
   );
 }

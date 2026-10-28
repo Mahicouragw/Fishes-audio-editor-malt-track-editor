@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ProjectStore } from '../store/projectStore';
 import { Transport } from './Transport';
 import { Timeline } from './Timeline';
-import { TrackControls, VocalPanel, HarmonyPanel, RangeEffectsPanel } from './EffectsPanel';
+import { TrackControls, VocalPanel, RangeEffectsPanel } from './EffectsPanel';
+import { useElapsed } from './useElapsed';
+import { HarmonizationPanel, type HarmonyDraft, type HarmonyDraftVoice } from './HarmonizationPanel';
 import { RecordPanel } from './RecordPanel';
 import { SilencePanel } from './SilencePanel';
 import { MergePanel } from './MergePanel';
@@ -10,13 +12,28 @@ import { ExportDialog } from './ExportDialog';
 import { PlaybackEngine, type ScheduledClip } from '../audio/engine';
 import { loadAudioData, storeAudioData, cacheAudioData } from '../storage/assets';
 import { audioDataToAudioBuffer } from '../audio/decode';
+import { resampleAudio, cloneAudio, audioData } from '../audio/dsp';
 import { decodeWav } from '../audio/wav';
 import { encodeWavBlob } from '../audio/wav';
-import { prepareClipData, effectivePitchSemis, harmonyClipFactor } from '../audio/mixdown';
+import { prepareClipData, effectivePitchSemis, harmonyClipFactor, originalVoiceFactor, effectivePan } from '../audio/mixdown';
+import {
+  applyLayerEffects,
+  buildSourceTimeline,
+  harmonyTargetNames as resolveHarmonyTargetNames,
+  mixVoiceSignals,
+  renderHarmonyVoice,
+  sliceClipSegment,
+  validateHarmonyRange,
+  validateHarmonyRanges,
+  voicesFromPreset,
+  type HarmonyPreset,
+  type HarmonySourceSegment,
+  type HarmonyScopeSpec,
+} from '../audio/harmony';
 import { runDspJob } from '../audio/dspRunner';
 import { useDsp } from '../audio/useDsp';
 import type { SeparationResult } from '../audio/separation';
-import type { AudioData, Clip, RangeEffect, Track } from '../types';
+import type { AudioData, Clip, HarmonyLayer, RangeEffect, Track } from '../types';
 import { clamp, formatTime, makeId, projectDuration } from '../types';
 
 export type StudioTab = 'effects' | 'record' | 'silence' | 'merge';
@@ -37,6 +54,31 @@ function clipKey(track: Track, clip: Clip): string {
   return [clip.assetId, effectivePitchSemis(track), vocalKey, clip.fadeIn, clip.fadeOut, JSON.stringify(clip.effects), clip.sourceStart].join('|');
 }
 
+/**
+ * Combine the caller's cancel signal with a hard timeout, so a separation
+ * server that stops answering produces an error instead of a button that
+ * reads "Separating 0 %" for ever. `AbortSignal.any` is not available in older
+ * tablet browsers, so the two signals are wired manually.
+ */
+function requestSignal(parent: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`The separation server did not answer within ${Math.round(timeoutMs / 1000)} seconds`));
+  }, timeoutMs);
+  const forward = () => controller.abort(parent?.reason);
+  if (parent) {
+    if (parent.aborted) forward();
+    else parent.addEventListener('abort', forward, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      parent?.removeEventListener('abort', forward);
+    },
+  };
+}
+
 export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectStore; initialTab?: StudioTab }) {
   const [position, setPosition] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -45,6 +87,28 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const [showExport, setShowExport] = useState(false);
   const [activeTab, setActiveTab] = useState<StudioTab>(initialTab);
   const [prep, setPrep] = useState({ busy: false, progress: 0, message: '' });
+  const [harmonySourceTrackId, setHarmonySourceTrackId] = useState('');
+  const [harmonyMediaDuration, setHarmonyMediaDuration] = useState(0);
+  const [harmonyProgress, setHarmonyProgress] = useState({ busy: false, progress: 0, message: '' });
+  const [harmonyError, setHarmonyError] = useState('');
+  /** What the engine is playing right now: the project timeline or a preview. */
+  const [playingPreview, setPlayingPreview] = useState<string | null>(null);
+  const lastUiPosition = useRef(0);
+  /** Cancels the harmony render that is currently running (Preview/Apply). */
+  const harmonyAbortRef = useRef<AbortController | null>(null);
+  /** Cancels the playback/export preparation that is currently running. */
+  const prepAbortRef = useRef<AbortController | null>(null);
+  /** Cancels the vocal separation that is currently running. */
+  const sepAbortRef = useRef<AbortController | null>(null);
+  /** Progress of vocal separation, including the network stages of a server. */
+  const [sepRun, setSepRun] = useState({ busy: false, progress: 0, message: '' });
+  /**
+   * Progress of the range-effect job *this panel* started. The shared dsp state
+   * used to drive every panel's progress bar, so turning on Human Voice
+   * Processing also made the range-effect panel display "Starting 0 %" for work
+   * the user never started.
+   */
+  const [rangeRun, setRangeRun] = useState({ busy: false, progress: 0, message: '' });
   const engineRef = useRef<PlaybackEngine | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const preparedRef = useRef(new Map<string, Prepared>());
@@ -53,12 +117,56 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const fallbackAnnouncedRef = useRef<Set<string>>(new Set());
 
   const dsp = useDsp();
+  /** How long the current DSP job has been running (shown so a slow device is visibly working). */
+  const dspElapsed = useElapsed(dsp.busy);
   const project = store.project;
   const selectedTrack = project.tracks.find((t) => t.id === project.selectedTrackId) ?? project.tracks[0] ?? null;
 
   const duration = useMemo(() => projectDuration(project, new Map<string, number>()), [project]);
   const durationRef = useRef(duration);
   durationRef.current = duration;
+
+  // The harmonization panel works on one source track; default to the track
+  // selected in the timeline and follow it when the user picks another.
+  useEffect(() => {
+    if (!harmonySourceTrackId || !project.tracks.some((t) => t.id === harmonySourceTrackId)) {
+      setHarmonySourceTrackId(selectedTrack?.id ?? project.tracks[0]?.id ?? '');
+    }
+  }, [harmonySourceTrackId, project.tracks, selectedTrack]);
+
+  // The real media duration of the harmonization source — used to validate a
+  // selected range against the actual file, not against the visible waveform.
+  const harmonySourceAssetId = project.tracks.find((t) => t.id === harmonySourceTrackId)?.clips[0]?.assetId ?? '';
+  useEffect(() => {
+    let cancelled = false;
+    if (!harmonySourceAssetId) {
+      setHarmonyMediaDuration(0);
+      return undefined;
+    }
+    void (async () => {
+      try {
+        const asset = await loadAudioData(harmonySourceAssetId);
+        if (!cancelled) setHarmonyMediaDuration(asset.length / asset.sampleRate);
+      } catch {
+        if (!cancelled) setHarmonyMediaDuration(0);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [harmonySourceAssetId]);
+
+  /**
+   * Push the playhead to React at a readable rate. The engine ticks every
+   * 40 ms; re-rendering the whole studio 25 times a second churns every text
+   * node in the page (including anything a screen reader is looking at), so
+   * the display is throttled while the audio clock itself stays exact.
+   */
+  const reportPosition = useCallback((value: number, force = false) => {
+    positionRef.current = value;
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (!force && now - lastUiPosition.current < 200) return;
+    lastUiPosition.current = now;
+    setPosition(value);
+  }, []);
 
   const getEngine = useCallback(() => {
     if (!engineRef.current) engineRef.current = new PlaybackEngine();
@@ -102,7 +210,10 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       start: clip.start,
       sourceStart: clip.sourceStart,
       duration: playable,
-      gain: track.volume * clip.gain * harmonyClipFactor(track, clip, project.harmonies),
+      gain: track.volume * clip.gain
+        * harmonyClipFactor(track, clip, project.harmonies)
+        * originalVoiceFactor(track, project.harmonies),
+      pan: effectivePan(track, clip, project.harmonies),
     };
   }, [project.harmonies]);
 
@@ -132,6 +243,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             onProgress: (p, m) => {
               if (token === prepTokenRef.current) setPrep({ busy: true, progress: (i + p) / todo.length, message: `${m} — ${clip.name}` });
             },
+            signal: prepAbortRef.current?.signal,
           });
           const buffer = await audioDataToAudioBuffer(getAudioContext(), data);
           preparedRef.current.set(key, { key, buffer, duration: buffer.duration });
@@ -146,6 +258,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const startPlayback = useCallback(async (from: number) => {
     setError('');
     if (prep.busy) return;
+    prepAbortRef.current = new AbortController();
     try {
       const clips = await ensurePrepared();
       const d = Math.max(0, durationRef.current);
@@ -155,26 +268,34 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       }
       const engine = getEngine();
       await engine.play(clips, from, d, {
-        onPosition: (p) => {
-          positionRef.current = p;
-          setPosition(p);
-        },
+        onPosition: (p) => reportPosition(p),
         onEnded: () => {
           setPlaying(false);
           setPaused(false);
-          positionRef.current = d;
-          setPosition(d);
+          setPlayingPreview(null);
+          reportPosition(d, true);
           store.announce('Playback finished');
         },
       });
       setPlaying(true);
       setPaused(false);
+      setPlayingPreview(null);
+      store.announce(`Playing from ${formatTime(from)}`);
     } catch (e) {
-      setError((e as Error).message);
+      const message = (e as Error).message;
       setPlaying(false);
       setPaused(false);
+      if (/cancelled|interrupted/i.test(message)) {
+        // Cancelling is a user action, not an error.
+        store.announce('Audio processing cancelled');
+      } else {
+        setError(message);
+        store.announce(`Playback failed: ${message}`);
+      }
+    } finally {
+      prepAbortRef.current = null;
     }
-  }, [ensurePrepared, getEngine, prep.busy, store]);
+  }, [ensurePrepared, getEngine, prep.busy, reportPosition, store]);
 
   const handlePlay = useCallback(async () => {
     const engine = getEngine();
@@ -182,34 +303,34 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       await engine.resume();
       setPlaying(true);
       setPaused(false);
-      store.announce('Resumed');
+      store.announce(playingPreview ? `Resumed ${playingPreview}` : 'Resumed playback');
       return;
     }
+    // Already running: do not schedule a second pass.
+    if (engine.isPlaying()) return;
     await startPlayback(positionRef.current);
-  }, [getEngine, startPlayback, store]);
+  }, [getEngine, playingPreview, startPlayback, store]);
 
   const handlePause = useCallback(() => {
     const p = getEngine().pause();
-    positionRef.current = p;
-    setPosition(p);
+    reportPosition(p, true);
     setPlaying(false);
     setPaused(true);
     store.announce(`Paused at ${formatTime(p)}`);
-  }, [getEngine, store]);
+  }, [getEngine, reportPosition, store]);
 
   const handleStop = useCallback(() => {
     getEngine().stop();
-    positionRef.current = 0;
-    setPosition(0);
+    reportPosition(0, true);
     setPlaying(false);
     setPaused(false);
+    setPlayingPreview(null);
     store.announce('Stopped');
-  }, [getEngine, store]);
+  }, [getEngine, reportPosition, store]);
 
   const handleSeek = useCallback(async (t: number) => {
     const target = clamp(t, 0, durationRef.current);
-    positionRef.current = target;
-    setPosition(target);
+    reportPosition(target, true);
     const engine = getEngine();
     if (engine.isPlaying() || engine.isPaused()) await engine.seek(target);
   }, [getEngine]);
@@ -222,17 +343,15 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     } else {
       target = clamp(positionRef.current + delta, 0, durationRef.current);
     }
-    positionRef.current = target;
-    setPosition(target);
-  }, [getEngine, store.settings.skipSeconds]);
+    reportPosition(target, true);
+  }, [getEngine, reportPosition, store.settings.skipSeconds]);
 
   const handleRestart = useCallback(async () => {
-    positionRef.current = 0;
-    setPosition(0);
+    reportPosition(0, true);
     const engine = getEngine();
     if (engine.isPlaying() || engine.isPaused()) await engine.seek(0);
     else await startPlayback(0);
-  }, [getEngine, startPlayback]);
+  }, [getEngine, reportPosition, startPlayback]);
 
   /** Play a single rendered buffer (previews never touch the prepared cache). */
   const playPreview = useCallback(async (label: string, data: AudioData) => {
@@ -244,17 +363,33 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         0,
         buffer.duration,
         {
-          onPosition: (p) => { positionRef.current = p; setPosition(p); },
-          onEnded: () => { setPlaying(false); setPaused(false); },
+          onPosition: (p) => reportPosition(p),
+          onEnded: () => {
+            setPlaying(false);
+            setPaused(false);
+            setPlayingPreview(null);
+          },
         },
       );
       setPlaying(true);
       setPaused(false);
-      store.announce(`Preview: ${label}`);
+      setPlayingPreview(label);
+      store.announce(`Playing preview: ${label}`);
     } catch (e) {
       setError((e as Error).message);
+      setPlaying(false);
+      setPaused(false);
+      setPlayingPreview(null);
     }
-  }, [getAudioContext, getEngine, store]);
+  }, [getAudioContext, getEngine, reportPosition, store]);
+
+  const findClip = useCallback((clipId: string): { track: Track; clip: Clip } | null => {
+    for (const track of project.tracks) {
+      const clip = track.clips.find((c) => c.id === clipId);
+      if (clip) return { track, clip };
+    }
+    return null;
+  }, [project.tracks]);
 
   const handlePreview = useCallback(async (kind: 'original' | 'vocal' | 'processed') => {
     if (!selectedTrack?.clips.length) { setError('Select a track with audio to preview'); return; }
@@ -308,7 +443,15 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         });
         const buffer = await audioDataToAudioBuffer(getAudioContext(), data);
         const playable = Math.max(0, Math.min(clip.duration, buffer.duration - clip.sourceStart));
-        rendered.push({ id: clip.id, buffer, start: clip.start, sourceStart: clip.sourceStart, duration: playable, gain: track.volume * clip.gain });
+        rendered.push({
+          id: clip.id,
+          buffer,
+          start: clip.start,
+          sourceStart: clip.sourceStart,
+          duration: playable,
+          gain: track.volume * clip.gain,
+          pan: effectivePan(track, clip, project.harmonies),
+        });
       }
       const end = Math.max(...rendered.map((c) => c.start + c.duration));
       const engine = getEngine();
@@ -324,20 +467,30 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       setPrep({ busy: false, progress: 0, message: '' });
       setError((e as Error).message);
     }
-  }, [getAudioContext, getEngine, store]);
+  }, [getAudioContext, getEngine, project.harmonies, store]);
 
   const handleTrackPitch = useCallback((trackId: string, semitones: number, cents = 0) => {
     store.setTrackPitch(trackId, semitones, cents);
     store.announce(`${(project.tracks.find((t) => t.id === trackId) ?? {}).name ?? 'Track'} pitch applied: ${semitones >= 0 ? '+' : ''}${semitones} semitones${cents ? `, ${cents} cents` : ''}`);
   }, [project.tracks, store]);
 
-  const handleSeparate = useCallback(async () => {
-    if (!selectedTrack || !selectedTrack.clips.length) { setError('Select a track with audio to separate'); return; }
+  const separateTrack = useCallback(async (targetTrack: Track | null | undefined) => {
+    const working = targetTrack ?? selectedTrack;
+    if (!working || !working.clips.length) { setError('Select a track with audio to separate'); return; }
     setError('');
-    store.setVocalState(selectedTrack.id, { status: 'processing', error: undefined, warning: undefined });
-    const clip = selectedTrack.clips[0];
-    const trackId = selectedTrack.id;
-    const trackName = selectedTrack.name;
+    // A second run replaces the first instead of queueing behind it.
+    sepAbortRef.current?.abort();
+    const controller = new AbortController();
+    sepAbortRef.current = controller;
+    const stage = (progress: number, message: string) => {
+      if (sepAbortRef.current !== controller) return;
+      setSepRun({ busy: true, progress, message });
+    };
+    store.setVocalState(working.id, { status: 'processing', error: undefined, warning: undefined });
+    const clip = working.clips[0];
+    const trackId = working.id;
+    const trackName = working.name;
+    stage(0, 'Loading audio');
     try {
       let vocal: AudioData;
       let instrumental: AudioData;
@@ -345,17 +498,35 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       const apiUrl = store.settings.separationApiUrl.trim();
       if (apiUrl) {
         const data = await loadAudioData(clip.assetId);
+        if (controller.signal.aborted) throw new Error('Separation cancelled');
+        stage(0.06, 'Encoding the track for the separation server');
         const blob = encodeWavBlob(data, { bitDepth: 16, channels: data.channels.length >= 2 ? 2 : 1 });
         const form = new FormData();
         form.append('file', blob, 'track.wav');
         const base = apiUrl.replace(/\/$/, '');
-        const response = await fetch(`${base}/separate`, { method: 'POST', body: form });
+        stage(0.12, 'Uploading to the separation server');
+        // Demucs on a CPU can take minutes, but a request that never answers
+        // must not leave the progress bar at 0 % for ever.
+        const upload = requestSignal(controller.signal, 10 * 60 * 1000);
+        let response: Response;
+        try {
+          response = await fetch(`${base}/separate`, { method: 'POST', body: form, signal: upload.signal });
+        } finally {
+          upload.dispose();
+        }
         if (!response.ok) throw new Error(`Separation server error: ${response.status} ${await response.text()}`);
         const result = (await response.json()) as { vocalUrl?: string; instrumentalUrl?: string; quality?: number; message?: string };
         if (!result.vocalUrl || !result.instrumentalUrl) throw new Error('Separation server did not return vocal and accompaniment stems');
+        stage(0.75, 'Downloading the separated stems');
         const fetchStem = async (rawUrl: string): Promise<AudioData> => {
-          const stemResponse = await fetch(new URL(rawUrl, base).href);
-          if (!stemResponse.ok) throw new Error(`Could not download stem: ${stemResponse.status}`);
+          const download = requestSignal(controller.signal, 2 * 60 * 1000);
+          let stemResponse: Response;
+          try {
+            stemResponse = await fetch(new URL(rawUrl, base).href, { signal: download.signal });
+            if (!stemResponse.ok) throw new Error(`Could not download stem: ${stemResponse.status}`);
+          } finally {
+            download.dispose();
+          }
           const buffer = await stemResponse.arrayBuffer();
           try {
             return decodeWav(buffer);
@@ -377,13 +548,22 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         meta = { quality: result.quality ?? 0.9, method: 'demucs-server', message: 'Separation completed by Demucs server', warning: undefined };
       } else {
         const data = await loadAudioData(clip.assetId);
-        const outcome = await dsp.run({ kind: 'separate', data });
+        if (controller.signal.aborted) throw new Error('Separation cancelled');
+        stage(0.02, 'Separating vocals');
+        const outcome = await dsp.run(
+          { kind: 'separate', data },
+          {
+            signal: controller.signal,
+            onProgress: (p, m) => stage(0.02 + p * 0.9, m),
+          },
+        );
         const separation = (outcome.result ?? outcome.data) as SeparationResult | undefined;
         if (!separation || !separation.vocal) throw new Error('Vocal separation produced no stems');
         vocal = separation.vocal;
         instrumental = separation.instrumental;
         meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: separation.warning };
       }
+      stage(0.94, 'Saving the stems');
       const vocalAsset = await storeAudioData(vocal, `${trackName} vocals`, 'processed');
       const instAsset = await storeAudioData(instrumental, `${trackName} instrumental`, 'processed');
       cacheAudioData(vocalAsset.id, vocal);
@@ -399,45 +579,386 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         warning: meta.warning,
         error: undefined,
       });
+      stage(1, 'Vocal separation complete');
       store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence)`);
     } catch (e) {
-      store.setVocalState(trackId, { status: 'failed', error: (e as Error).message });
-      setError((e as Error).message);
+      const message = (e as Error).message || 'Vocal separation failed';
+      const cancelled = controller.signal.aborted || /cancelled|aborted/i.test(message);
+      store.setVocalState(trackId, { status: cancelled ? 'not-run' : 'failed', error: cancelled ? undefined : message });
+      if (cancelled) {
+        store.announce('Vocal separation cancelled');
+      } else {
+        setError(message);
+      }
+    } finally {
+      if (sepAbortRef.current === controller) {
+        sepAbortRef.current = null;
+        setSepRun({ busy: false, progress: 0, message: '' });
+      }
     }
   }, [selectedTrack, store, dsp]);
 
-  const handleHarmony = useCallback(async (sourceId: string, targetId: string, semitones: number, vocalsOnly: boolean) => {
-    setError('');
-    const source = project.tracks.find((t) => t.id === sourceId);
-    if (!source || !source.clips.length) { setError('Source track has no audio'); return; }
-    try {
-      let data = await loadAudioData(source.clips[0].assetId);
-      if (vocalsOnly) {
-        if (!source.vocal.vocalAssetId) throw new Error('No isolated vocals on the source track — run vocal separation first, or turn off “vocals only”');
-        data = await loadAudioData(source.vocal.vocalAssetId);
-      }
-      const outcome = await dsp.run({ kind: 'pitch', data, semitones });
+  /** Stop whatever playback/export preparation is running. */
+  const cancelPreparation = useCallback(() => {
+    prepAbortRef.current?.abort();
+    prepTokenRef.current += 1;
+    setPrep({ busy: false, progress: 0, message: '' });
+    store.announce('Audio processing cancelled');
+  }, [store]);
+
+  const cancelSeparation = useCallback(() => {
+    // Aborts the worker (which is the only way to stop a synchronous DSP loop)
+    // and any in-flight server request.
+    sepAbortRef.current?.abort();
+    sepAbortRef.current = null;
+    setSepRun({ busy: false, progress: 0, message: '' });
+    store.announce('Vocal separation cancelled');
+  }, [store]);
+
+  const handleSeparate = useCallback(() => separateTrack(selectedTrack), [selectedTrack, separateTrack]);
+
+  // ---------------------------------------------------------------------
+  // Harmonization — real rendered voices over the whole song or a range
+  // ---------------------------------------------------------------------
+  const harmonySourceId = harmonySourceTrackId || project.tracks[0]?.id || '';
+  // One harmonization group per source track; the compare controls act on it.
+  const appliedGroupId = project.harmonies.some((h) => h.groupId === `harmony:${harmonySourceId}`)
+    ? `harmony:${harmonySourceId}`
+    : null;
+
+  /**
+   * Lay the source track's clips out on one song-timeline buffer. The buffer
+   * keeps the original start time and duration, so a harmony voice covers the
+   * complete song (or exactly the requested range) without drifting.
+   */
+  const buildHarmonySource = useCallback(async (
+    track: Track,
+    vocalsOnly: boolean,
+  ): Promise<{ timeline: AudioData; mediaDuration: number; contentDuration: number }> => {
+    if (!track.clips.length) throw new Error('The source track has no audio to harmonize.');
+    const segments: HarmonySourceSegment[] = [];
+    let mediaDuration = 0;
+    let sampleRate = 0;
+    for (const clip of track.clips) {
+      const assetId = vocalsOnly && track.vocal.vocalAssetId ? track.vocal.vocalAssetId : clip.assetId;
+      const asset = await loadAudioData(assetId);
+      mediaDuration = Math.max(mediaDuration, asset.length / asset.sampleRate);
+      if (!sampleRate) sampleRate = asset.sampleRate;
+      const segment = sliceClipSegment(asset, clip.sourceStart, clip.duration);
+      segments.push({
+        start: clip.start,
+        // One timeline rate keeps every clip sample-aligned even if the
+        // imported files came from different sources.
+        data: segment.sampleRate === sampleRate ? segment : resampleAudio(segment, sampleRate),
+      });
+    }
+    const contentDuration = Math.max(...track.clips.map((c) => c.start + c.duration));
+    const timeline = buildSourceTimeline(segments, contentDuration, sampleRate || 44100);
+    return { timeline, mediaDuration, contentDuration };
+  }, []);
+
+  /** Names for the non-original voices, skipping tracks already in use. */
+  const harmonyTargetNames = useCallback((draft: HarmonyDraft, source: Track): string[] => (
+    resolveHarmonyTargetNames(draft.voices, source.name, draft.separateOriginalTrack)
+  ), []);
+
+  /** Render the enabled voices of a draft into real audio (no project change). */
+  const renderHarmonyDraft = useCallback(async (
+    draft: HarmonyDraft,
+    onProgress?: (p: number, message: string) => void,
+  ): Promise<Array<{ voice: HarmonyDraftVoice; data: AudioData }>> => {
+    const source = project.tracks.find((t) => t.id === draft.sourceTrackId);
+    if (!source) throw new Error('Select a source track that contains audio.');
+    if (draft.vocalsOnly && !(source.vocal.status === 'ready' && source.vocal.vocalAssetId)) {
+      throw new Error('Human Voice Mode needs separated stems. Run vocal separation on the source track first.');
+    }
+    const { timeline } = await buildHarmonySource(source, draft.vocalsOnly);
+    const enabled = draft.voices.filter((v) => v.enabled);
+    if (!enabled.length) throw new Error('Enable at least one harmony voice.');
+    const rendered: Array<{ voice: HarmonyDraftVoice; data: AudioData }> = [];
+    for (let i = 0; i < enabled.length; i++) {
+      const voice = enabled[i];
+      const total = voice.semitones + voice.detuneCents / 100;
+      const label = `Rendering ${voice.name}`;
+      onProgress?.(i / enabled.length, label);
+      // Rendered in the shared worker so a long song never freezes the page.
+      const outcome = Math.abs(total) < 1e-9
+        ? { data: cloneAudio(timeline) }
+        : await runDspJob(
+          {
+            kind: 'harmonyVoice',
+            data: timeline,
+            semitones: voice.semitones,
+            detuneCents: voice.detuneCents,
+            scope: draft.scope,
+            clipStart: 0,
+            effects: voice.effects,
+            outside: 'silence',
+            // Every generated track — +3, +4 and +7 alike — uses the natural
+            // vocal path: a real spectral shift that re-imposes the singer's
+            // formants after the resample. Never send 0 here; `0` is only the
+            // A/B reference used by the DSP tests.
+            formantPreserve: 1,
+          },
+          (p, m) => onProgress?.((i + p) / enabled.length, `${label} — ${m}`),
+          { signal: harmonyAbortRef.current?.signal },
+        );
       if (!outcome.data) throw new Error('Harmony rendering produced no audio');
-      await store.addHarmony(sourceId, targetId, semitones, outcome.data);
+      rendered.push({ voice, data: outcome.data });
+    }
+    onProgress?.(1, 'Harmony voices rendered');
+    return rendered;
+  }, [buildHarmonySource, project.tracks]);
+
+  const handleHarmonyPreview = useCallback(async (draft: HarmonyDraft) => {
+    setError('');
+    setHarmonyError('');
+    // Show the bar before the first (potentially slow) step, so the panel can
+    // never look idle while a long render is starting.
+    setHarmonyProgress({ busy: true, progress: 0, message: 'Preparing source audio' });
+    harmonyAbortRef.current = new AbortController();
+    try {
+      const rendered = await renderHarmonyDraft(draft, (p, m) => setHarmonyProgress({ busy: true, progress: p, message: m }));
+      // The preview is the same mix the apply step will create: real pitch,
+      // real gains, real delays (the delay is a placement, so it is applied
+      // by shifting each voice inside the preview buffer) and real panning.
+      const longest = rendered.reduce((max, r) => Math.max(max, r.data.length), 0);
+      const mixed = mixVoiceSignals(rendered.map((r) => {
+        const delay = Math.round(r.voice.offsetSeconds * r.data.sampleRate);
+        const shifted = delay > 0
+          ? audioData(r.data.channels.map((channel) => {
+            const out = new Float32Array(longest);
+            out.set(channel.subarray(0, Math.max(0, longest - delay)), delay);
+            return out;
+          }), r.data.sampleRate)
+          : r.data;
+        return { data: shifted, gain: r.voice.gain, pan: r.voice.pan };
+      }), rendered[0]?.data.sampleRate ?? 44100);
+      await playPreview('harmony preview (not applied yet)', mixed);
     } catch (e) {
+      if (!/cancelled/i.test((e as Error).message)) {
+        setHarmonyError((e as Error).message);
+        setError((e as Error).message);
+      }
+    } finally {
+      harmonyAbortRef.current = null;
+      setHarmonyProgress({ busy: false, progress: 0, message: '' });
+    }
+  }, [playPreview, renderHarmonyDraft]);
+
+  const handleHarmonyApply = useCallback(async (draft: HarmonyDraft) => {
+    setError('');
+    setHarmonyError('');
+    const source = project.tracks.find((t) => t.id === draft.sourceTrackId);
+    if (!source || !source.clips.length) {
+      setHarmonyError('Select a source track that contains audio.');
+      return;
+    }
+    const enabled = draft.voices.filter((v) => v.enabled);
+    if (!enabled.length) {
+      setHarmonyError('Enable at least one harmony voice.');
+      return;
+    }
+    if (draft.vocalsOnly && !(source.vocal.status === 'ready' && source.vocal.vocalAssetId)) {
+      setHarmonyError('Human Voice Mode needs separated stems. Run vocal separation on the source track first.');
+      return;
+    }
+    const ranges = draft.scope.scope === 'range' ? (draft.scope.ranges ?? [{ start: draft.scope.start, end: draft.scope.end }]) : undefined;
+    if (ranges) {
+      const problem = validateHarmonyRanges(ranges, harmonyMediaDuration);
+      if (problem) {
+        setHarmonyError(problem);
+        return;
+      }
+    }
+    harmonyAbortRef.current = new AbortController();
+    try {
+      setHarmonyProgress({ busy: true, progress: 0, message: 'Preparing source audio' });
+      const { timeline, contentDuration } = await buildHarmonySource(source, draft.vocalsOnly);
+      if (ranges) {
+        const overlap = ranges.some((r) => Math.min(r.end, contentDuration) - Math.max(0, r.start) > 0);
+        if (!overlap) throw new Error('The selected ranges do not overlap the source audio.');
+      }
+      const names = harmonyTargetNames(draft, source);
+      const trackIds = store.ensureTracks(names.filter(Boolean));
+      let idCursor = 0;
+      const targetIds = names.map((name) => {
+        if (!name) return source.id;
+        return trackIds[idCursor++];
+      });
+
+      const groupId = `harmony:${source.id}`;
+      const voices = [] as Parameters<typeof store.applyHarmonyGroup>[2];
+      for (let i = 0; i < enabled.length; i++) {
+        const voice = enabled[i];
+        const targetId = targetIds[i] ?? source.id;
+        const total = voice.semitones + voice.detuneCents / 100;
+        const label = voice.name || (Math.abs(total) < 1e-9 ? 'Original lead (+0)' : `Harmony ${voice.semitones >= 0 ? '+' : ''}${voice.semitones}`);
+        setHarmonyProgress({ busy: true, progress: (i + 0.5) / enabled.length, message: `Rendering ${label}` });
+        const isUnprocessedLead = Math.abs(total) < 1e-9 && voice.offsetSeconds === 0;
+        if (isUnprocessedLead && !draft.separateOriginalTrack) {
+          // The +0 lead reuses the source track's own audio — no duplicate.
+          voices.push({
+            name: label,
+            semitones: voice.semitones,
+            gain: voice.gain,
+            muted: false,
+            solo: false,
+            vocalsOnly: draft.vocalsOnly,
+            offsetSeconds: 0,
+            pan: voice.pan,
+            effects: [],
+            scope: draft.scope.scope,
+            rangeStart: ranges?.[0]?.start,
+            rangeEnd: ranges?.[0]?.end,
+            ranges,
+            targetTrackId: source.id,
+          });
+          continue;
+        }
+        const renderedOutcome = Math.abs(total) < 1e-9
+          ? { data: cloneAudio(timeline) }
+          : await runDspJob(
+            {
+              kind: 'harmonyVoice',
+              data: timeline,
+              semitones: voice.semitones,
+              detuneCents: voice.detuneCents,
+              scope: draft.scope,
+              clipStart: 0,
+              effects: voice.effects,
+              outside: 'silence',
+            },
+            (p, m) => setHarmonyProgress({
+              busy: true,
+              progress: (i + p) / enabled.length,
+              message: `Rendering ${label} — ${m}`,
+            }),
+          );
+        const rendered = renderedOutcome.data;
+        if (!rendered) throw new Error('Harmony rendering produced no audio');
+        const asset = await storeAudioData(rendered, label, 'processed');
+        cacheAudioData(asset.id, rendered);
+        const renderedDuration = rendered.length / rendered.sampleRate;
+        const delay = Math.max(0, Math.min(5, voice.offsetSeconds));
+        voices.push({
+          name: label,
+          semitones: voice.semitones,
+          gain: voice.gain,
+          muted: false,
+          solo: false,
+          vocalsOnly: draft.vocalsOnly,
+          offsetSeconds: delay,
+          pan: voice.pan,
+          effects: voice.effects,
+          scope: draft.scope.scope,
+          rangeStart: ranges?.[0]?.start,
+          rangeEnd: ranges?.[0]?.end,
+          ranges,
+          targetTrackId: targetId,
+          clip: {
+            assetId: asset.id,
+            // The delay moves the clip inside the song; the tail is trimmed so
+            // a 3:32 song stays 3:32.
+            start: delay,
+            duration: Math.max(0.001, Math.min(renderedDuration, contentDuration - delay)),
+            fullDuration: renderedDuration,
+            size: asset.size,
+          },
+        });
+      }
+      store.applyHarmonyGroup(groupId, source.id, voices);
+      store.announce(`Harmony applied to ${source.name}: ${enabled.map((v) => `${v.semitones >= 0 ? '+' : ''}${v.semitones}`).join(', ')}`);
+      setHarmonyProgress({ busy: false, progress: 0, message: '' });
+    } catch (e) {
+      setHarmonyProgress({ busy: false, progress: 0, message: '' });
+      if (!/cancelled/i.test((e as Error).message)) {
+        setHarmonyError((e as Error).message);
+        setError((e as Error).message);
+      }
+    } finally {
+      harmonyAbortRef.current = null;
+    }
+  }, [buildHarmonySource, harmonyMediaDuration, harmonyTargetNames, project.tracks, store]);
+
+  const handleHarmonyCancel = useCallback(() => {
+    // Stop a render that is still running; nothing is applied either way.
+    harmonyAbortRef.current?.abort();
+    harmonyAbortRef.current = null;
+    setHarmonyProgress({ busy: false, progress: 0, message: '' });
+    setHarmonyError('');
+    store.announce('Harmonization cancelled — nothing was applied');
+  }, [store]);
+
+  const handleHarmonyLayerRerender = useCallback(async (layerId: string, semitones: number, effects: RangeEffect[]) => {
+    setError('');
+    setHarmonyError('');
+    const layer = project.harmonies.find((h) => h.id === layerId);
+    if (!layer) return;
+    const source = project.tracks.find((t) => t.id === layer.sourceTrackId);
+    if (!source) { setHarmonyError('The source track no longer exists.'); return; }
+    try {
+      setHarmonyProgress({ busy: true, progress: 0, message: 'Re-rendering harmony voice' });
+      const { timeline } = await buildHarmonySource(source, layer.vocalsOnly);
+      const scope: HarmonyScopeSpec = {
+        scope: layer.scope,
+        start: layer.ranges?.[0]?.start ?? layer.rangeStart ?? 0,
+        end: layer.ranges?.[0]?.end ?? layer.rangeEnd ?? 0,
+        ranges: layer.ranges,
+      };
+      const total = semitones + (layer.detuneCents ?? 0) / 100;
+      const outcome = Math.abs(total) < 1e-9
+        ? { data: cloneAudio(timeline) }
+        : await runDspJob(
+          {
+            kind: 'harmonyVoice',
+            data: timeline,
+            semitones,
+            detuneCents: layer.detuneCents ?? 0,
+            scope,
+            clipStart: 0,
+            effects,
+            outside: 'silence',
+            // Re-renders (turning a voice on, changing its interval) must use
+            // the same natural-vocal path as the first render.
+            formantPreserve: 1,
+          },
+        (p, m) => setHarmonyProgress({ busy: true, progress: p, message: m }),
+        { signal: harmonyAbortRef.current?.signal },
+      );
+      const rendered = outcome.data;
+      if (!rendered) throw new Error('Harmony rendering produced no audio');
+      const label = semitones === 0 ? 'Original (+0)' : `Harmony ${semitones >= 0 ? '+' : ''}${semitones}`;
+      const asset = await storeAudioData(rendered, label, 'processed');
+      cacheAudioData(asset.id, rendered);
+      const delay = layer.offsetSeconds ?? 0;
+      const full = rendered.length / rendered.sampleRate;
+      store.replaceHarmonyClip(layerId, asset.id, full, asset.size, label);
+      store.updateHarmony(layerId, { semitones, effects, name: label, clipDuration: full });
+      store.setHarmonyOffset(layerId, delay);
+      store.announce(`${label} re-rendered`);
+    } catch (e) {
+      setHarmonyError((e as Error).message);
       setError((e as Error).message);
+    } finally {
+      setHarmonyProgress({ busy: false, progress: 0, message: '' });
     }
-  }, [dsp, project.tracks, store]);
+  }, [buildHarmonySource, project.harmonies, project.tracks, store]);
 
-  const findClip = useCallback((clipId: string): { track: Track; clip: Clip } | null => {
-    for (const track of project.tracks) {
-      const clip = track.clips.find((c) => c.id === clipId);
-      if (clip) return { track, clip };
+  const handleHarmonyLayerPreview = useCallback(async (layerId: string) => {
+    setError('');
+    const layer = project.harmonies.find((h) => h.id === layerId);
+    if (!layer) return;
+    if (layer.originalVoice) {
+      // The original voice is the source track's own audio.
+      const source = project.tracks.find((t) => t.id === layer.sourceTrackId);
+      if (!source?.clips.length) { setError('The original voice has no audio.'); return; }
+      await previewTrack(source);
+      return;
     }
-    return null;
-  }, [project.tracks]);
-
-  const handleHarmonyPreview = useCallback(async (harmonyId: string) => {
-    const layer = project.harmonies.find((h) => h.id === harmonyId);
-    if (!layer?.clipId) { setError('Harmony layer has no audio'); return; }
+    if (!layer.clipId) { setError('Harmony layer has no audio'); return; }
     const found = findClip(layer.clipId);
     if (!found) { setError('Harmony clip not found'); return; }
-    setError('');
     try {
       const prepared = preparedRef.current.get(clipKey(found.track, found.clip));
       let buffer: AudioBuffer;
@@ -450,7 +971,15 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       const playable = Math.max(0, Math.min(found.clip.duration, buffer.duration - found.clip.sourceStart));
       const engine = getEngine();
       await engine.play(
-        [{ id: found.clip.id, buffer, start: 0, sourceStart: found.clip.sourceStart, duration: playable, gain: 1 }],
+        [{
+          id: found.clip.id,
+          buffer,
+          start: 0,
+          sourceStart: found.clip.sourceStart,
+          duration: playable,
+          gain: layer.muted ? 0 : layer.gain,
+          pan: layer.pan ?? 0,
+        }],
         0,
         playable,
         { onEnded: () => { setPlaying(false); setPaused(false); } },
@@ -461,7 +990,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     } catch (e) {
       setError((e as Error).message);
     }
-  }, [findClip, getAudioContext, getEngine, project.harmonies, store]);
+  }, [findClip, getAudioContext, getEngine, previewTrack, project.harmonies, project.tracks, store]);
 
   // Range effects — validate against the actual clip, preview before applying.
   const rangeTargetClip = useCallback((): { track: Track; clip: Clip } | null => {
@@ -493,7 +1022,16 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
     const clipSeconds = data.length / data.sampleRate;
     if (effect.start >= effect.end) throw new Error('Start time must be earlier than end time');
     if (effect.start < 0 || effect.end > clipSeconds + 0.001) throw new Error(`Selection must be inside this clip (0 to ${formatTime(clipSeconds)})`);
-    const outcome = await dsp.run({ kind: 'range', data, effect });
+    setRangeRun({ busy: true, progress: 0, message: `Preparing ${effect.type}` });
+    let outcome;
+    try {
+      outcome = await dsp.run(
+        { kind: 'range', data, effect },
+        { onProgress: (progress, message) => setRangeRun({ busy: true, progress, message }) },
+      );
+    } finally {
+      setRangeRun({ busy: false, progress: 0, message: '' });
+    }
     if (!outcome.data) throw new Error('Effect produced no audio');
     if (!apply) {
       await playPreview(`${effect.type} on selected range (preview, not applied)`, outcome.data);
@@ -541,7 +1079,14 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
           <button type="button" className="btn" aria-label="New track" onClick={() => store.addTrack()}>New track</button>
           <button type="button" className="btn" aria-label="Save project" onClick={() => store.save().catch(() => undefined)}>Save project</button>
           <button type="button" className="btn btn-primary" aria-label="Export audio" onClick={() => setShowExport(true)}>Export</button>
-          <span className="hint" aria-live="polite">{formatTime(position)} / {formatTime(duration)}</span>
+          {/* The running clock is deliberately NOT a live region: a value that
+              changes 25 times a second makes TalkBack queue announcements
+              forever, which is what stopped the cursor from moving during
+              playback. The transport's own time field reads on demand. */}
+          <span className="hint" aria-live="off">{formatTime(position)} / {formatTime(duration)}</span>
+          {/* Which bundle this device actually loaded: a stale cache otherwise
+              looks exactly like a bug that was never fixed. */}
+          <span className="hint" aria-live="off" title="Build of the running bundle" aria-label={`Running build ${__BUILD_ID__}`}>build {__BUILD_ID__}</span>
         </div>
       </header>
 
@@ -553,16 +1098,28 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       />
 
       {prep.busy && (
-        <div className="progress" role="progressbar" aria-valuenow={Math.round(prep.progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={prep.message}>
-          <div className="progress-bar" style={{ width: `${prep.progress * 100}%` }} />
-          <span aria-live="polite">{prep.message} {Math.round(prep.progress * 100)}%</span>
+        <div className="row wrap">
+          <div className="progress" role="progressbar" aria-valuenow={Math.round(prep.progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={prep.message}>
+            <div className="progress-bar" style={{ width: `${prep.progress * 100}%` }} />
+            <span>{prep.message} {Math.round(prep.progress * 100)}%</span>
+          </div>
+          {/* Human-voice rendering can take a while on a long song. The user
+              must always be able to stop it without reloading the page. */}
+          <button
+            type="button"
+            className="btn"
+            aria-label="Cancel audio processing"
+            onClick={cancelPreparation}
+          >
+            Cancel
+          </button>
         </div>
       )}
 
       {dsp.busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(dsp.progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={dsp.message}>
           <div className="progress-bar" style={{ width: `${dsp.progress * 100}%` }} />
-          <span aria-live="polite">{dsp.message} {Math.round(dsp.progress * 100)}%</span>
+          <span aria-live="off">{dsp.message} {Math.round(dsp.progress * 100)}% · {dspElapsed}s</span>
         </div>
       )}
 
@@ -607,35 +1164,100 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                     onPreviewPitch={(s) => previewTrack(selectedTrack, s)}
                     onPreviewOriginal={() => previewTrack(selectedTrack)}
                     onVolume={(v) => store.setTrackVolume(selectedTrack.id, v)}
+                    onPan={(value) => store.setTrackPan(selectedTrack.id, value)}
                     onMute={() => store.toggleMute(selectedTrack.id)}
                     onSolo={() => store.toggleSolo(selectedTrack.id)}
                     onRename={(n) => store.renameTrack(selectedTrack.id, n)}
                     onDuplicate={() => store.duplicateTrack(selectedTrack.id)}
+                    onDuplicateOriginal={() => store.duplicateOriginalTrack(selectedTrack.id)}
                     onDelete={() => store.deleteTrack(selectedTrack.id)}
                   />
                   <VocalPanel
                     track={selectedTrack}
-                    onToggle={(v) => store.setVocalState(selectedTrack.id, { enabled: v })}
+                    onToggle={(v) => {
+                      store.setVocalState(selectedTrack.id, { enabled: v });
+                      // Turning human-voice processing ON runs the real
+                      // separation immediately; pitch is never applied to a
+                      // "voice" that was only filtered out.
+                      if (v && !(selectedTrack.vocal.status === 'ready' && selectedTrack.vocal.vocalAssetId)) {
+                        void handleSeparate();
+                      }
+                    }}
                     onPitch={(s) => store.setVocalState(selectedTrack.id, { pitchSemis: s })}
-                    onPreserve={(v) => store.setVocalState(selectedTrack.id, { preserveTempo: v })}
                     onVocalVolume={(v) => store.setVocalState(selectedTrack.id, { vocalVolume: v })}
                     onMix={(v) => store.setVocalState(selectedTrack.id, { mixWithAccompaniment: v })}
                     onSeparate={handleSeparate}
                     onPreview={handlePreview}
-                    busy={dsp.busy} progress={dsp.progress} message={dsp.message}
+                    busy={sepRun.busy || prep.busy}
+                    disabled={rangeRun.busy || harmonyProgress.busy}
+                    progress={sepRun.busy ? sepRun.progress : prep.progress}
+                    message={sepRun.busy ? sepRun.message : prep.message}
+                    onCancel={() => (sepRun.busy ? cancelSeparation() : cancelPreparation())}
                   />
                 </>
               )}
-              <HarmonyPanel
+              <HarmonizationPanel
                 tracks={project.tracks}
                 harmonies={project.harmonies}
-                onCreate={handleHarmony}
+                sourceTrackId={harmonySourceId}
+                onSourceTrackChange={setHarmonySourceTrackId}
+                mediaDuration={harmonyMediaDuration}
+                hasVocalStems={Boolean(
+                  project.tracks.find((t) => t.id === harmonySourceId)?.vocal.status === 'ready'
+                  && project.tracks.find((t) => t.id === harmonySourceId)?.vocal.vocalAssetId,
+                )}
+                onRunSeparation={() => {
+                  const source = project.tracks.find((t) => t.id === harmonySourceId);
+                  void separateTrack(source);
+                }}
+                ranges={project.harmonyRanges ?? []}
+                onAddRange={() => {
+                  const selection = project.selection;
+                  const duration = harmonyMediaDuration || 0;
+                  if (selection && selection.end > selection.start) {
+                    store.addHarmonyRange({ start: selection.start, end: selection.end });
+                    return;
+                  }
+                  const start = 0;
+                  const end = duration > 0 ? Math.min(duration, start + 20) : 20;
+                  store.addHarmonyRange({ start, end: Math.max(start + 0.1, end) });
+                }}
+                onUpdateRange={store.updateHarmonyRange}
+                onRemoveRange={store.removeHarmonyRange}
+                songKey={project.harmonyKey ?? 'C'}
+                scale={project.harmonyScale ?? 'major'}
+                onKeyChange={store.setHarmonyKey}
+                onScaleChange={store.setHarmonyScale}
+                activeGroupId={appliedGroupId}
+                onCompare={(muted) => {
+                  if (appliedGroupId) store.setHarmonyGroupMuted(appliedGroupId, muted);
+                }}
+                onSoloHarmony={() => {
+                  if (appliedGroupId) store.setHarmonyGroupSolo(appliedGroupId, true);
+                }}
+                busy={harmonyProgress.busy}
+                disabled={sepRun.busy || prep.busy || rangeRun.busy || dsp.busy}
+                progress={harmonyProgress.progress}
+                message={harmonyProgress.message}
+                error={harmonyError}
+                canUndo={store.canUndo}
+                canRedo={store.canRedo}
+                onUndo={store.undo}
+                onRedo={store.redo}
+                previewPlaying={playingPreview !== null && playing}
+                previewPaused={playingPreview !== null && paused}
+                onPausePreview={handlePause}
+                onResumePreview={handlePlay}
+                onStopPreview={handleStop}
                 onPreview={handleHarmonyPreview}
-                onMute={(id, muted) => store.updateHarmony(id, { muted })}
-                onGain={(id, gain) => store.updateHarmony(id, { gain })}
-                onRemove={store.removeHarmony}
-                onDuplicate={store.duplicateHarmony}
-                busy={dsp.busy}
+                onApply={handleHarmonyApply}
+                onCancel={handleHarmonyCancel}
+                onLayerPatch={(id, patch) => store.updateHarmony(id, patch)}
+                onLayerOffset={store.setHarmonyOffset}
+                onLayerPreview={handleHarmonyLayerPreview}
+                onLayerRemove={store.removeHarmony}
+                onLayerDuplicate={store.duplicateHarmony}
+                onLayerRerender={handleHarmonyLayerRerender}
               />
               <RangeEffectsPanel
                 duration={duration}
@@ -644,7 +1266,10 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                 onSelection={store.setSelection}
                 onPreview={handleRangePreview}
                 onApply={handleRangeApply}
-                busy={dsp.busy} progress={dsp.progress} message={dsp.message}
+                busy={rangeRun.busy}
+                disabled={sepRun.busy || prep.busy || harmonyProgress.busy}
+                progress={rangeRun.progress}
+                message={rangeRun.message}
               />
             </>
           )}

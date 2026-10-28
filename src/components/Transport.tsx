@@ -19,10 +19,16 @@ export function Transport({
       <div className="transport-controls">
         <button type="button" className="btn btn-icon" aria-label="Restart playback" onClick={onRestart}><RotateCcw size={18} aria-hidden="true" /></button>
         <button type="button" className="btn btn-icon" aria-label={`Skip backward ${skipSeconds} seconds`} onClick={onSkipBack}><SkipBack size={20} aria-hidden="true" /></button>
+        {/* One button, three states: Play → Pause → Resume. The accessible
+            name always says what pressing it will do. */}
         {!playing ? (
-          <button type="button" className="btn btn-primary btn-play" aria-label={paused ? 'Resume playback' : 'Play'} onClick={onPlay}><Play size={22} aria-hidden="true" /></button>
+          <button type="button" className="btn btn-primary btn-play" aria-label={paused ? 'Resume playback' : 'Play'} onClick={onPlay}>
+            <Play size={22} aria-hidden="true" />
+          </button>
         ) : (
-          <button type="button" className="btn btn-primary btn-play" aria-label="Pause" onClick={onPause}><Pause size={22} aria-hidden="true" /></button>
+          <button type="button" className="btn btn-primary btn-play" aria-label="Pause playback" onClick={onPause}>
+            <Pause size={22} aria-hidden="true" />
+          </button>
         )}
         <button type="button" className="btn btn-icon" aria-label={`Skip forward ${skipSeconds} seconds`} onClick={onSkipForward}><SkipForward size={20} aria-hidden="true" /></button>
         <button type="button" className="btn btn-icon" aria-label="Stop" onClick={onStop}><Square size={18} aria-hidden="true" /></button>

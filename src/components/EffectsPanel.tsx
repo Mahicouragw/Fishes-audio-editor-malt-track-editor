@@ -1,20 +1,24 @@
 import { useEffect, useState } from 'react';
+import { useElapsed } from './useElapsed';
 import type { HarmonyLayer, RangeEffect, Track } from '../types';
 import { formatTime, parseTime, makeId } from '../types';
+import { describePan } from '../audio/harmony';
 
 export function describeSemis(semis: number): string {
   if (semis === 0) return 'original pitch';
   return `${semis > 0 ? 'plus' : 'minus'} ${Math.abs(semis)} semitones`;
 }
 
-export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewOriginal, onVolume, onMute, onSolo, onRename, onDuplicate, onDelete }: {
+export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewOriginal, onVolume, onPan, onMute, onSolo, onRename, onDuplicate, onDuplicateOriginal, onDelete }: {
   track: Track;
   busy: boolean;
   onPitch: (semis: number, cents: number) => void;
   onPreviewPitch: (semis: number) => void;
   onPreviewOriginal: () => void;
   onVolume: (v: number) => void;
-  onMute: () => void; onSolo: () => void; onRename: (n: string) => void; onDuplicate: () => void; onDelete: () => void;
+  onPan: (pan: number) => void;
+  onMute: () => void; onSolo: () => void; onRename: (n: string) => void;
+  onDuplicate: () => void; onDuplicateOriginal: () => void; onDelete: () => void;
 }) {
   const [name, setName] = useState(track.name);
   const [pendingSemis, setPendingSemis] = useState(track.pitchSemis);
@@ -38,13 +42,32 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
       <div className="row">
         <button type="button" className={`btn ${track.muted ? 'btn-active' : ''}`} aria-pressed={track.muted} aria-label={`${track.muted ? 'Unmute' : 'Mute'} ${track.name}`} onClick={onMute}>{track.muted ? 'Unmute' : 'Mute'}</button>
         <button type="button" className={`btn ${track.solo ? 'btn-active' : ''}`} aria-pressed={track.solo} aria-label={`${track.solo ? 'Unsolo' : 'Solo'} ${track.name}`} onClick={onSolo}>Solo</button>
-        <button type="button" className="btn" aria-label={`Duplicate ${track.name}`} onClick={onDuplicate}>Duplicate</button>
+        <button type="button" className="btn" aria-label={`Duplicate ${track.name} with its settings`} onClick={onDuplicate}>Duplicate</button>
+        <button type="button" className="btn" aria-label={`Duplicate ${track.name} at original pitch without effects`} onClick={onDuplicateOriginal}>Duplicate lead (unprocessed)</button>
         <button type="button" className="btn btn-danger" aria-label={`Delete ${track.name}`} onClick={onDelete}>Delete</button>
       </div>
       <label className="field">
         <span>Volume: {Math.round(track.volume * 100)}%</span>
         <input type="range" min={0} max={2} step={0.01} value={track.volume} aria-label={`${track.name} volume, ${Math.round(track.volume * 100)} percent`} onChange={(e) => onVolume(Number(e.target.value))} />
       </label>
+      <fieldset className="field" aria-label={`${track.name} stereo pan`}>
+        <legend>Pan: {describePan(track.pan ?? 0)}</legend>
+        <div className="row wrap">
+          <button type="button" className="btn btn-xs" aria-label={`Pan ${track.name} hard left`} onClick={() => onPan(-1)}>L</button>
+          <button type="button" className="btn btn-xs" aria-label={`Centre the pan of ${track.name}`} onClick={() => onPan(0)}>C</button>
+          <button type="button" className="btn btn-xs" aria-label={`Pan ${track.name} hard right`} onClick={() => onPan(1)}>R</button>
+        </div>
+        <input
+          type="range"
+          min={-1}
+          max={1}
+          step={0.01}
+          value={track.pan ?? 0}
+          aria-label={`${track.name} pan, ${describePan(track.pan ?? 0)}`}
+          onChange={(e) => onPan(Number(e.target.value))}
+        />
+        <p className="hint">Real stereo pan (constant power). It is applied in live playback and in the exported file.</p>
+      </fieldset>
       <div className="field">
         <span>Pitch (preview, then apply): {describeSemis(pendingSemis)}{pendingCents ? `, ${pendingCents > 0 ? '+' : ''}${pendingCents} cents` : ''}</span>
         <div className="row">
@@ -61,26 +84,33 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
           <span>Fine tuning (cents): {pendingCents > 0 ? `+${pendingCents}` : pendingCents}</span>
           <input type="range" min={-50} max={50} step={1} value={pendingCents} aria-label={`${track.name} fine tuning, ${pendingCents} cents`} disabled={busy} onChange={(e) => setPendingCents(Number(e.target.value))} />
         </label>
-        <div className="row" aria-live="polite">
+        <div className="row">
           <button type="button" className="btn" aria-label={`Preview ${track.name} at ${describeSemis(pendingSemis)}`} disabled={busy} onClick={() => onPreviewPitch(pendingSemis)}>Preview</button>
           <button type="button" className="btn" aria-label={`Preview ${track.name} at original pitch`} disabled={busy} onClick={onPreviewOriginal}>Preview original</button>
           <button type="button" className="btn btn-primary" aria-label={`Apply pitch ${describeSemis(pendingSemis)} to ${track.name}`} disabled={busy || !dirty} onClick={() => onPitch(pendingSemis, pendingCents)}>Apply</button>
           <button type="button" className="btn" aria-label={`Cancel pitch change on ${track.name}`} disabled={busy || !dirty} onClick={() => { setPendingSemis(track.pitchSemis); setPendingCents(track.pitchFineCents); }}>Cancel</button>
           <button type="button" className="btn" aria-label={`Reset pitch of ${track.name} to original`} disabled={busy || (pendingSemis === 0 && pendingCents === 0)} onClick={() => { setPendingSemis(0); setPendingCents(0); }}>Reset</button>
         </div>
-        <p className="hint">Pitch is a real tempo-preserving phase-vocoder shift. Applied pitch is committed to the track; Undo restores the previous value.</p>
+        <p className="hint">Pitch is a real formant-preserving spectral shift: tempo and duration stay identical, and the vocal-tract character is kept. Applied pitch is committed to the track; Undo restores the previous value.</p>
       </div>
     </section>
   );
 }
 
-export function VocalPanel({ track, onToggle, onPitch, onPreserve, onVocalVolume, onMix, onSeparate, onPreview, busy, progress, message }: {
+export function VocalPanel({ track, onToggle, onPitch, onVocalVolume, onMix, onSeparate, onPreview, busy, progress, message, disabled = false, onCancel }: {
   track: Track;
-  onToggle: (v: boolean) => void; onPitch: (s: number) => void; onPreserve: (v: boolean) => void; onVocalVolume: (v: number) => void; onMix: (v: boolean) => void;
+  onToggle: (v: boolean) => void; onPitch: (s: number) => void; onVocalVolume: (v: number) => void; onMix: (v: boolean) => void;
   onSeparate: () => void; onPreview: (kind: 'original' | 'vocal' | 'processed') => void;
   busy: boolean; progress: number; message: string;
+  /** Another panel's job is running: disable the controls, show no progress bar. */
+  disabled?: boolean;
+  /** Stop a separation that is still running. */
+  onCancel: () => void;
 }) {
   const v = track.vocal;
+  // A visible counter proves the page is alive while a long render is still on
+  // its first stage. Not a live region: it would talk over everything else.
+  const elapsed = useElapsed(busy);
   return (
     <section className="panel" aria-label="Human voice processing">
       <h3 className="panel-title">Human Voice Processing</h3>
@@ -88,7 +118,7 @@ export function VocalPanel({ track, onToggle, onPitch, onPreserve, onVocalVolume
         type="button" role="switch" aria-checked={v.enabled}
         aria-label={`Human Voice Processing, ${v.enabled ? 'on' : 'off'}`}
         className={`switch ${v.enabled ? 'on' : 'off'}`}
-        disabled={busy}
+        disabled={busy || disabled}
         onClick={() => onToggle(!v.enabled)}
       >
         <span className="switch-track"><span className="switch-thumb" /></span>
@@ -105,115 +135,53 @@ export function VocalPanel({ track, onToggle, onPitch, onPreserve, onVocalVolume
       {busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={message}>
           <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
-          <span aria-live="polite">{message} {Math.round(progress * 100)}%</span>
+          <span aria-live="off">{message} {Math.round(progress * 100)}% · {elapsed}s</span>
         </div>
       )}
+      {busy && (
+        <p className="hint" role="note">
+          Separation runs the whole track through a spectral analysis. A 3½-minute song
+          takes roughly a minute on a phone or tablet — the percentage updates as it works
+          and you can cancel at any point.
+        </p>
+      )}
+      {busy && (
+        <button type="button" className="btn btn-xs" aria-label="Cancel vocal separation" onClick={onCancel}>
+          Cancel separation
+        </button>
+      )}
       <div className="row">
-        <button type="button" className="btn btn-primary" aria-label="Run vocal separation" onClick={onSeparate} disabled={busy}>
+        <button type="button" className="btn btn-primary" aria-label="Run vocal separation" onClick={onSeparate} disabled={busy || disabled}>
           {busy ? `Separating ${Math.round(progress * 100)}%` : 'Run vocal separation'}
         </button>
-        <button type="button" className="btn" aria-label="Preview original track audio" onClick={() => onPreview('original')} disabled={busy}>Original</button>
-        <button type="button" className="btn" aria-label="Preview isolated vocal stem" onClick={() => onPreview('vocal')} disabled={busy || v.status !== 'ready' || !v.vocalAssetId}>Vocal stem</button>
-        <button type="button" className="btn" aria-label="Preview processed vocals mixed with accompaniment" onClick={() => onPreview('processed')} disabled={busy || v.status !== 'ready' || !v.vocalAssetId}>Processed mix</button>
+        <button type="button" className="btn" aria-label="Preview original track audio" onClick={() => onPreview('original')} disabled={busy || disabled}>Original</button>
+        <button type="button" className="btn" aria-label="Preview isolated vocal stem" onClick={() => onPreview('vocal')} disabled={busy || disabled || v.status !== 'ready' || !v.vocalAssetId}>Vocal stem</button>
+        <button type="button" className="btn" aria-label="Preview processed vocals mixed with accompaniment" onClick={() => onPreview('processed')} disabled={busy || disabled || v.status !== 'ready' || !v.vocalAssetId}>Processed mix</button>
       </div>
       <label className="field">
         <span>Vocal pitch: {describeSemis(v.pitchSemis)}</span>
-        <input type="range" min={-12} max={12} step={1} value={v.pitchSemis} aria-label={`Vocal pitch, ${describeSemis(v.pitchSemis)}`} disabled={busy} onChange={(e) => onPitch(Number(e.target.value))} />
+        <input type="range" min={-12} max={12} step={1} value={v.pitchSemis} aria-label={`Vocal pitch, ${describeSemis(v.pitchSemis)}`} disabled={busy || disabled} onChange={(e) => onPitch(Number(e.target.value))} />
       </label>
-      <label className="field checkbox">
-        <input type="checkbox" checked={v.preserveTempo} aria-label="Preserve tempo when pitch shifting vocals" disabled={busy} onChange={(e) => onPreserve(e.target.checked)} />
-        <span>Preserve tempo (phase vocoder; unchecking uses a plain resample that changes speed)</span>
-      </label>
+      {v.enabled && v.status === 'ready' && (
+        <p className="hint">
+          While Human Voice Processing is ON, this vocal pitch is what you hear: it is applied to the separated vocal
+          (tempo preserved) and mixed with the untouched accompaniment. The track pitch above only applies when this is OFF.
+        </p>
+      )}
+      <p className="hint" role="note">
+        Tempo and duration are always preserved: pitch is shifted by formant-preserving spectral remapping, never by
+        changing playback speed or sample rate.
+      </p>
       <label className="field">
         <span>Vocal volume: {Math.round(v.vocalVolume * 100)}%</span>
-        <input type="range" min={0} max={2} step={0.01} value={v.vocalVolume} aria-label="Vocal volume, percent" disabled={busy} onChange={(e) => onVocalVolume(Number(e.target.value))} />
+        <input type="range" min={0} max={2} step={0.01} value={v.vocalVolume} aria-label="Vocal volume, percent" disabled={busy || disabled} onChange={(e) => onVocalVolume(Number(e.target.value))} />
       </label>
       <label className="field checkbox">
-        <input type="checkbox" checked={v.mixWithAccompaniment} aria-label="Mix processed vocals with original accompaniment" disabled={busy} onChange={(e) => onMix(e.target.checked)} />
+        <input type="checkbox" checked={v.mixWithAccompaniment} aria-label="Mix processed vocals with original accompaniment" disabled={busy || disabled} onChange={(e) => onMix(e.target.checked)} />
         <span>Mix processed vocals with original accompaniment</span>
       </label>
-      <button type="button" className="btn" aria-label="Restore original audio for this track" onClick={() => { onToggle(false); onPitch(0); }} disabled={busy}>Restore original audio</button>
+      <button type="button" className="btn" aria-label="Restore original audio for this track" onClick={() => { onToggle(false); onPitch(0); }} disabled={busy || disabled}>Restore original audio</button>
       <p className="hint">Local separation is an honest approximation (REPET-style background estimate + stereo-centre + harmonic salience mask). Centred or harmonic instruments can remain in the stem. For studio quality, connect a Demucs server in Settings. This is never presented as an EQ trick.</p>
-    </section>
-  );
-}
-
-const HARMONY_PRESETS = [0, 3, 4, 7, -3, -4, -7];
-
-export function HarmonyPanel({ tracks, harmonies, onCreate, onPreview, onMute, onGain, onRemove, onDuplicate, busy }: {
-  tracks: Track[];
-  harmonies: HarmonyLayer[];
-  onCreate: (sourceId: string, targetId: string, semitones: number, vocalsOnly: boolean) => void;
-  onPreview: (harmonyId: string) => void;
-  onMute: (harmonyId: string, muted: boolean) => void;
-  onGain: (harmonyId: string, gain: number) => void;
-  onRemove: (harmonyId: string) => void;
-  onDuplicate: (harmonyId: string) => void;
-  busy: boolean;
-}) {
-  const [source, setSource] = useState(tracks[0]?.id ?? '');
-  const [target, setTarget] = useState(tracks[1]?.id ?? tracks[0]?.id ?? '');
-  const [semis, setSemis] = useState(7);
-  const [custom, setCustom] = useState('');
-  const [vocalsOnly, setVocalsOnly] = useState(false);
-
-  const trackName = (id: string) => tracks.find((t) => t.id === id)?.name ?? 'Unknown track';
-  const effectiveTarget = target === source ? (tracks.find((t) => t.id !== source)?.id ?? '') : target;
-  const effectiveSemis = Number.isFinite(Number(custom)) && custom.trim() !== '' ? clampInt(Number(custom), -24, 24) : semis;
-
-  return (
-    <section className="panel" aria-label="Harmony generator">
-      <h3 className="panel-title">Harmony Generator</h3>
-      <p className="hint">Each layer is a real pitch-shifted signal (tempo preserved) placed on its own track at the source's start position. Layers are independently previewable, muteable, gain-adjustable, duplicable and removable.</p>
-      <label className="field">
-        <span>Source track</span>
-        <select value={source} aria-label="Harmony source track" onChange={(e) => setSource(e.target.value)}>
-          {tracks.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-        </select>
-      </label>
-      <label className="field">
-        <span>Target track</span>
-        <select value={effectiveTarget} aria-label="Harmony target track" onChange={(e) => setTarget(e.target.value)}>
-          {tracks.filter((t) => t.id !== source).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-        </select>
-      </label>
-      <div className="field">
-        <span>Interval: {effectiveSemis >= 0 ? `+${effectiveSemis}` : effectiveSemis} semitones</span>
-        <div className="row wrap">
-          {HARMONY_PRESETS.map((p) => (
-            <button key={p} type="button" className={`btn btn-xs ${effectiveSemis === p ? 'btn-active' : ''}`} aria-pressed={effectiveSemis === p} aria-label={`Harmony interval ${describeSemis(p)}`} onClick={() => { setSemis(p); setCustom(''); }}>{p >= 0 ? `+${p}` : p}</button>
-          ))}
-          <input type="number" min={-24} max={24} step={1} value={custom} placeholder="Custom" aria-label="Custom harmony semitones" onChange={(e) => setCustom(e.target.value)} />
-        </div>
-      </div>
-      <label className="field checkbox">
-        <input type="checkbox" checked={vocalsOnly} aria-label="Apply harmonization only to isolated human vocals" onChange={(e) => setVocalsOnly(e.target.checked)} />
-        <span>Apply only to isolated vocals (requires separation on the source track)</span>
-      </label>
-      <button type="button" className="btn btn-primary" aria-label={`Create harmony ${describeSemis(effectiveSemis)} from ${trackName(source)} to ${trackName(effectiveTarget)}`} disabled={busy || !source || !effectiveTarget || !effectiveTarget} onClick={() => onCreate(source, effectiveTarget, effectiveSemis, vocalsOnly)}>Create harmony layer</button>
-
-      {harmonies.length > 0 && (
-        <ul className="region-list" aria-label="Harmony layers">
-          {harmonies.map((h) => (
-            <li key={h.id} className="merge-item">
-              <span>
-                {h.name} · {trackName(h.sourceTrackId)} → {trackName(h.targetTrackId)}
-                <span className="hint" style={{ display: 'block' }}>{describeSemis(h.semitones)}{h.vocalsOnly ? ' · vocals only' : ''}</span>
-              </span>
-              <span className="row">
-                <button type="button" className="btn btn-xs" aria-label={`Preview harmony ${h.name}`} onClick={() => onPreview(h.id)} disabled={busy}>Preview</button>
-                <button type="button" className={`btn btn-xs ${h.muted ? 'btn-active' : ''}`} aria-pressed={h.muted} aria-label={`${h.muted ? 'Unmute' : 'Mute'} harmony ${h.name}`} onClick={() => onMute(h.id, !h.muted)} disabled={busy}>{h.muted ? 'Unmute' : 'Mute'}</button>
-                <label className="clip-field" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                  <span>Gain</span>
-                  <input type="range" min={0} max={2} step={0.05} value={h.gain} aria-label={`Harmony ${h.name} gain, ${Math.round(h.gain * 100)} percent`} onChange={(e) => onGain(h.id, Number(e.target.value))} style={{ width: 80 }} />
-                </label>
-                <button type="button" className="btn btn-xs" aria-label={`Duplicate harmony ${h.name}`} onClick={() => { void onDuplicate(h.id); }} disabled={busy}>Duplicate</button>
-                <button type="button" className="btn btn-xs btn-danger" aria-label={`Remove harmony ${h.name}`} onClick={() => onRemove(h.id)} disabled={busy}>Remove</button>
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
     </section>
   );
 }
@@ -224,7 +192,7 @@ function clampInt(v: number, min: number, max: number): number {
 
 const RANGE_HARMONY_INTERVALS = [0, 3, 4, 7, -3, -4, -7];
 
-export function RangeEffectsPanel({ duration, selection, clipDuration, onSelection, onPreview, onApply, busy, progress, message }: {
+export function RangeEffectsPanel({ duration, selection, clipDuration, onSelection, onPreview, onApply, busy, progress, message, disabled = false }: {
   duration: number;
   selection: { start: number; end: number } | null;
   /** Resolves the length (seconds) of the clip this panel would act on. */
@@ -235,6 +203,8 @@ export function RangeEffectsPanel({ duration, selection, clipDuration, onSelecti
   busy: boolean;
   progress: number;
   message: string;
+  /** Another panel's job is running: disable the controls, show no progress bar. */
+  disabled?: boolean;
 }) {
   const [start, setStart] = useState(selection?.start ?? 5);
   const [end, setEnd] = useState(selection?.end ?? Math.min(25, duration || 25));
@@ -407,12 +377,12 @@ export function RangeEffectsPanel({ duration, selection, clipDuration, onSelecti
       {busy && (
         <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={message}>
           <div className="progress-bar" style={{ width: `${progress * 100}%` }} />
-          <span aria-live="polite">{message} {Math.round(progress * 100)}%</span>
+          <span>{message} {Math.round(progress * 100)}%</span>
         </div>
       )}
       <div className="row">
-        <button type="button" className="btn btn-primary" aria-label="Apply effect to selected range" disabled={busy} onClick={() => run(true)}>Apply to Selection</button>
-        <button type="button" className="btn" aria-label="Preview effect on selected range without applying" disabled={busy} onClick={() => run(false)}>Preview</button>
+        <button type="button" className="btn btn-primary" aria-label="Apply effect to selected range" disabled={busy || disabled} onClick={() => run(true)}>Apply to Selection</button>
+        <button type="button" className="btn" aria-label="Preview effect on selected range without applying" disabled={busy || disabled} onClick={() => run(false)}>Preview</button>
         <button type="button" className="btn" aria-label="Clear selection" onClick={() => onSelection(null)}>Clear</button>
       </div>
     </section>
