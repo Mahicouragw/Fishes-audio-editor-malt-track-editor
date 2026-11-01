@@ -65,6 +65,11 @@ export interface Clip {
   id: string;
   assetId: string;
   name: string;
+  /**
+   * Stereo position for this clip, -1 (hard left) … 0 (centre) … +1 (hard
+   * right). `undefined` means "follow the track's pan".
+   */
+  pan?: number;
   /** Timeline start in seconds; a numeric field is always available (no drag-only editing). */
   start: number;
   /** Offset into the source asset in seconds. */
@@ -81,6 +86,8 @@ export interface Track {
   id: string;
   name: string;
   volume: number;
+  /** Stereo position -1 … +1. Real panning in playback and export. */
+  pan: number;
   muted: boolean;
   solo: boolean;
   /** Committed, whole-track pitch adjustment in semitones. */
@@ -88,6 +95,25 @@ export interface Track {
   pitchFineCents: number;
   clips: Clip[];
   vocal: VocalState;
+}
+
+/** Which part of the song a harmony voice covers. */
+export type HarmonyScope = 'entire-song' | 'range';
+
+/** Musical key used to keep harmony intervals diatonic. */
+export type HarmonyKey = 'C' | 'C#' | 'D' | 'D#' | 'E' | 'F' | 'F#' | 'G' | 'G#' | 'A' | 'A#' | 'B';
+export type HarmonyScale = 'major' | 'minor';
+
+/** A time range that harmonization applies to (song timeline). */
+export interface HarmonyRange {
+  id: string;
+  /** Song-time start in seconds. */
+  start: number;
+  /** Song-time end in seconds. */
+  end: number;
+  enabled: boolean;
+  /** Optional user label, announced by screen readers. */
+  label?: string;
 }
 
 export interface HarmonyLayer {
@@ -100,7 +126,32 @@ export interface HarmonyLayer {
   semitones: number;
   gain: number;
   muted: boolean;
+  solo: boolean;
   vocalsOnly: boolean;
+  /** Timing offset (delay) relative to the source start, in seconds. */
+  offsetSeconds: number;
+  /** Stereo position of this voice, -1 … +1. */
+  pan?: number;
+  /** Micro-detune in cents used to de-correlate doubled voices. */
+  detuneCents?: number;
+  /** Full rendered length before the delay trims it, in seconds. */
+  clipDuration?: number;
+  /** Effects baked into this layer's rendered signal (independent per voice). */
+  effects: RangeEffect[];
+  /** Entire song or a selected time range. */
+  scope: HarmonyScope;
+  /** Song-time range when scope is 'range'. */
+  rangeStart?: number;
+  rangeEnd?: number;
+  /** All ranges when a voice was applied to several non-contiguous sections. */
+  ranges?: Array<{ start: number; end: number }>;
+  /**
+   * True for the +0 voice. The original-pitch voice reuses the source track's
+   * own audio, so no duplicated audio is rendered for it.
+   */
+  originalVoice: boolean;
+  /** Groups the layers produced by one harmonization apply, so it can be replaced or undone as a unit. */
+  groupId?: string;
 }
 
 export interface RecordingTake {
@@ -144,6 +195,11 @@ export interface Project {
   updatedAt: number;
   tracks: Track[];
   harmonies: HarmonyLayer[];
+  /** Reusable time ranges for harmonization (multiple, non-contiguous). */
+  harmonyRanges: HarmonyRange[];
+  /** Musical key used for diatonic harmony hints and snapping. */
+  harmonyKey: HarmonyKey;
+  harmonyScale: HarmonyScale;
   selection: { start: number; end: number } | null;
   selectedTrackId: string | null;
   selectedClipId: string | null;

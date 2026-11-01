@@ -11,6 +11,8 @@ export interface ScheduledClip {
   duration: number;
   /** Linear gain for this clip (track volume, mute/solo and clip gain already applied). */
   gain: number;
+  /** Stereo position, -1 (hard left) … 0 (centre) … +1 (hard right). */
+  pan?: number;
 }
 
 export interface EngineCallbacks {
@@ -21,6 +23,7 @@ export interface EngineCallbacks {
 interface ActiveSource {
   source: AudioBufferSourceNode;
   gain: GainNode;
+  panner: StereoPannerNode | null;
 }
 
 /**
@@ -43,6 +46,13 @@ export class PlaybackEngine {
   private playing = false;
   private paused = false;
   private token = 0;
+  /**
+   * Every state-changing request (play/pause/stop/seek/dispose) takes a ticket.
+   * `play()` awaits `context.resume()`, so two rapid presses used to interleave:
+   * both left the await, both scheduled their own sources and the clip played
+   * twice. A request that is superseded while it waits now does nothing.
+   */
+  private request = 0;
   private volume = 0.85;
   private ducked = false;
 
@@ -83,11 +93,13 @@ export class PlaybackEngine {
 
   private clearSources(): void {
     this.token++;
-    for (const { source, gain } of this.active) {
+    this.request++;
+    for (const { source, gain, panner } of this.active) {
       source.onended = null;
       try { source.stop(); } catch { /* already ended */ }
       source.disconnect();
       gain.disconnect();
+      panner?.disconnect();
     }
     this.active = [];
   }
@@ -106,7 +118,13 @@ export class PlaybackEngine {
 
   getPosition(): number {
     if (this.playing && this.context) {
-      return clamp(this.originTimeline + (this.context.currentTime - this.originContextTime), 0, this.duration);
+      // Playback is scheduled a few milliseconds ahead so every source starts
+      // on the same clock tick. Until that moment arrives the playhead must
+      // stay at the position playback was started from — otherwise a resume
+      // visibly jumps back by the scheduling lead, and repeated pause/resume
+      // cycles would walk the playhead backwards.
+      const elapsed = Math.max(0, this.context.currentTime - this.originContextTime);
+      return clamp(this.originTimeline + elapsed, 0, this.duration);
     }
     return this.position;
   }
@@ -121,8 +139,11 @@ export class PlaybackEngine {
 
   /** Stops any previous playback engine first — only one clock can own the graph. */
   async play(clips: ScheduledClip[], from: number, duration: number, callbacks: EngineCallbacks = {}): Promise<void> {
+    const ticket = ++this.request;
     const context = this.ensureContext();
     if (context.state === 'suspended') await context.resume();
+    // A pause, stop or a second play landed while the context was waking up.
+    if (ticket !== this.request) return;
     this.clearSources();
     this.clearTimer();
     this.clips = clips;
@@ -150,9 +171,20 @@ export class PlaybackEngine {
       const source = context.createBufferSource();
       source.buffer = clip.buffer;
       const gain = context.createGain();
-      gain.gain.value = clamp(clip.gain, 0, 4);
+      // The export pan law is unity at centre, so the live panner is
+      // compensated by √2 to match the exported file exactly.
+      const pan = clamp(clip.pan ?? 0, -1, 1);
+      gain.gain.value = clamp(clip.gain, 0, 4) * (pan === 0 ? 1 : Math.SQRT2);
+      let panner: StereoPannerNode | null = null;
       source.connect(gain);
-      gain.connect(this.master ?? context.destination);
+      if (typeof context.createStereoPanner === 'function' && pan !== 0) {
+        panner = context.createStereoPanner();
+        panner.pan.value = pan;
+        gain.connect(panner);
+        panner.connect(this.master ?? context.destination);
+      } else {
+        gain.connect(this.master ?? context.destination);
+      }
       const when = now + Math.max(0, relativeStart);
       try {
         source.start(when, Math.max(0, localOffset), playable);
@@ -165,8 +197,9 @@ export class PlaybackEngine {
         if (currentToken !== this.token) return;
         source.disconnect();
         gain.disconnect();
+        panner?.disconnect();
       };
-      this.active.push({ source, gain });
+      this.active.push({ source, gain, panner });
     }
     this.playing = true;
     this.timer = setInterval(() => {
@@ -191,10 +224,15 @@ export class PlaybackEngine {
   }
 
   pause(): number {
+    // Invalidate any play() that is still waiting for the context.
+    this.request++;
     if (!this.playing) return this.position;
     const position = this.getPosition();
     this.stopInternal(true);
     this.position = position;
+    // The playhead must land exactly where the sound stopped, for every
+    // caller — not just the one that reads the return value.
+    this.callbacks.onPosition?.(position);
     return position;
   }
 
@@ -204,10 +242,13 @@ export class PlaybackEngine {
       this.paused = false;
       return;
     }
+    // Resume from the stored paused position; `play` is fully re-scheduled, so
+    // the graph cannot end up with two sets of sources.
     await this.play(this.clips, this.position, this.duration, this.callbacks);
   }
 
   stop(): void {
+    this.request++;
     this.stopInternal(false);
     this.position = 0;
     this.callbacks.onPosition?.(0);
@@ -216,6 +257,7 @@ export class PlaybackEngine {
   async seek(seconds: number): Promise<void> {
     const target = clamp(seconds, 0, this.duration);
     if (this.playing) {
+      this.request++;
       await this.play(this.clips, target, this.duration, this.callbacks);
     } else {
       // Idle or paused: just move the cursor. Not marked paused so Play
@@ -239,6 +281,7 @@ export class PlaybackEngine {
 
   /** Called when a project is closed, media changes, or the editor unmounts. */
   async dispose(): Promise<void> {
+    this.request++;
     this.stopInternal(false);
     if (this.speechPoll) clearInterval(this.speechPoll);
     this.speechPoll = null;

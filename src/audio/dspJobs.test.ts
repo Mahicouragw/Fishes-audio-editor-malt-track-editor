@@ -24,6 +24,70 @@ describe('executeJob (shared by worker and main-thread fallback)', () => {
     expect(progress[progress.length - 1]).toBe(1);
   });
 
+  it('harmonyVoice job renders a real pitch shift in the requested scope', () => {
+    const input = sine(330, 22050, 2);
+    const progress: number[] = [];
+    const whole = executeJob(
+      {
+        kind: 'harmonyVoice',
+        data: input,
+        semitones: 4,
+        scope: { scope: 'entire-song', start: 0, end: 0 },
+        clipStart: 0,
+        effects: [],
+        outside: 'silence',
+      },
+      (p) => progress.push(p),
+    );
+    expect(whole.data?.length).toBe(input.length);
+    const expected = 330 * 2 ** (4 / 12);
+    expect(dominantFrequency(whole.data!.channels[0], 22050) / expected).toBeCloseTo(1, 1);
+    expect(progress[progress.length - 1]).toBe(1);
+
+    const ranged = executeJob({
+      kind: 'harmonyVoice',
+      data: input,
+      semitones: 4,
+      scope: { scope: 'range', start: 0.5, end: 1.5 },
+      clipStart: 0,
+      effects: [],
+      outside: 'silence',
+    });
+    // A harmony voice is silent outside its range.
+    expect(ranged.data!.channels[0][Math.round(0.1 * 22050)]).toBe(0);
+    expect(ranged.data!.channels[0][Math.round(1.9 * 22050)]).toBe(0);
+    expect(Math.abs(ranged.data!.channels[0][Math.round(1.0 * 22050)])).toBeGreaterThan(0);
+  });
+
+  it('harmonyVoice job applies per-voice effects', () => {
+    const input = sine(330, 22050, 1);
+    const plain = executeJob({
+      kind: 'harmonyVoice',
+      data: input,
+      semitones: 4,
+      scope: { scope: 'entire-song', start: 0, end: 0 },
+      clipStart: 0,
+      effects: [],
+      outside: 'silence',
+    });
+    const wet = executeJob({
+      kind: 'harmonyVoice',
+      data: input,
+      semitones: 4,
+      scope: { scope: 'entire-song', start: 0, end: 0 },
+      clipStart: 0,
+      effects: [{ id: 'r', type: 'echo', start: 0, end: 1, params: { echoDelay: 0.2, echoFeedback: 0.3, echoMix: 0.4 }, enabled: true }],
+      outside: 'silence',
+    });
+    expect(wet.data?.length).toBeGreaterThanOrEqual(plain.data!.length);
+    // The echo changes the waveform, so the job really applied the effect.
+    let difference = 0;
+    for (let i = 0; i < plain.data!.length; i += 37) {
+      difference += Math.abs(wet.data!.channels[0][i] - plain.data!.channels[0][i]);
+    }
+    expect(difference).toBeGreaterThan(0.01);
+  });
+
   it('pitch job rejects out-of-range semitones', () => {
     expect(() => executeJob({ kind: 'pitch', data: sine(220, 22050, 0.2), semitones: 30 })).toThrow();
   });
