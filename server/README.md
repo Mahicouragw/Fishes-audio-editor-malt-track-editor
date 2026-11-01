@@ -9,9 +9,15 @@
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Mahicouragw/Fishes-audio-editor-malt-track-editor)
 
 1. Fork this repo, then in Render: **New → Web Service → connect your fork**
-2. **Runtime:** Docker, **Dockerfile path:** `server/Dockerfile`
-3. Set env: `DEMUCS_MODEL=htdemucs`, `CORS_ORIGINS=https://mahicouragw.github.io` (your Pages URL)
-4. Deploy → copy the URL (e.g. `https://your-app.onrender.com`) → paste into app **Settings → Separation server URL**
+2. **Runtime:** Docker
+   - If **Root Directory** is EMPTY (recommended): set **Dockerfile path:** `server/Dockerfile`
+   - If you set **Root Directory:** `server` → set **Dockerfile path:** `Dockerfile` (not `server/Dockerfile` otherwise build fails with `server/server/Dockerfile not found` → status 1)
+3. **IMPORTANT FIX for your screenshot error `Exited with status 1` in 5.9s:** You used `Root Directory: server` + `server/Dockerfile` together. Change to ONE of:
+   - **Option A (recommended):** Root Directory = *(empty)*, Dockerfile = `server/Dockerfile`
+   - **Option B:** Root Directory = `server`, Dockerfile = `Dockerfile`
+   Clear **Build Command** and **Start Command** (Docker handles it via CMD)
+4. Set env: `DEMUCS_MODEL=htdemucs`, `CORS_ORIGINS=https://mahicouragw.github.io` (your Pages URL)
+5. Deploy → copy the URL (e.g. `https://your-app.onrender.com`) → paste into app **Settings → Separation server URL**
 
 ### Railway / Fly.io / VPS
 
