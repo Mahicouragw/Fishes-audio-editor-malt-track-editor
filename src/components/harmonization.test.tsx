@@ -349,10 +349,25 @@ describe('HarmonizationPanel', () => {
     expect(effects.map((effect) => effect.type)).toEqual(['reverb']);
   });
 
-  it('does not offer duplicate-audio controls for the original lead row', () => {
-    setup({ harmonies: [layer({ originalVoice: true, semitones: 0, name: 'Original (+0)', clipId: undefined })] });
-    expect(screen.queryByRole('spinbutton', { name: /Applied voice 1 semitones/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Update harmony voice 1/ })).not.toBeInTheDocument();
+  it('lets the original lead row be re-pitched, and says when the change is not applied yet', async () => {
+    // The +0 lead owns no clip (it reuses the source audio), so it used to have
+    // no interval control at all — asking to pitch it was impossible. It can now
+    // be re-pitched: rendering it creates a clip of its own.
+    const user = userEvent.setup();
+    const handlers = setup({ harmonies: [layer({ originalVoice: true, semitones: 0, name: 'Original (+0)', clipId: undefined })] });
+    const input = screen.getByRole('spinbutton', { name: /Applied voice 1 semitones/ });
+    expect(input).toBeInTheDocument();
+    expect(screen.queryByText(/Not applied yet/i)).toBeNull();
+
+    await user.clear(input);
+    await user.type(input, '12');
+    // The typed value is not applied until the user asks for it, and the panel
+    // says so instead of silently looking shifted.
+    expect(screen.getByText(/Not applied yet/i)).toBeInTheDocument();
+    expect(handlers.onLayerRerender).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: /Update harmony voice 1/ }));
+    expect(handlers.onLayerRerender).toHaveBeenCalledWith(expect.any(String), 12, []);
+
     // It can still be muted, soloed, panned and removed.
     expect(screen.getByRole('button', { name: 'Mute harmony voice 1, Original (+0)' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Remove harmony voice 1, Original (+0)' })).toBeInTheDocument();

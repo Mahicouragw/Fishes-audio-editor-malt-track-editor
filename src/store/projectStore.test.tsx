@@ -145,13 +145,23 @@ describe('project store', () => {
       await getStore().duplicateHarmony(harmonyId);
     });
     expect(getStore().project.harmonies).toHaveLength(2);
-    expect(getStore().project.tracks.find((t) => t.id === v2.id)?.clips).toHaveLength(2);
+    // A duplicate is its own voice: it owns real audio on a track of its own,
+    // so it can be re-pitched and panned without touching the original voice
+    // (and so duplicating the +0 lead can never add a second copy of the song
+    // to the source track).
+    const copy = getStore().project.harmonies.find((h) => h.id !== harmonyId)!;
+    expect(copy.clipId).toBeTruthy();
+    expect(copy.originalVoice).toBe(false);
+    expect(copy.targetTrackId).not.toBe(v2.id);
+    const copyTrack = getStore().project.tracks.find((t) => t.id === copy.targetTrackId)!;
+    expect(copyTrack.clips.some((c) => c.id === copy.clipId)).toBe(true);
+    expect(getStore().project.tracks.find((t) => t.id === v2.id)?.clips).toHaveLength(1);
 
     act(() => {
       getStore().removeHarmony(harmonyId);
     });
     expect(getStore().project.harmonies).toHaveLength(1);
-    expect(getStore().project.tracks.find((t) => t.id === v2.id)?.clips).toHaveLength(1);
+    expect(getStore().project.tracks.find((t) => t.id === v2.id)?.clips).toHaveLength(0);
     unmount();
   });
 

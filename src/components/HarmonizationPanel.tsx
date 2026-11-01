@@ -844,7 +844,11 @@ function AppliedVoiceRow({
             disabled={busy}
           />
         </label>
-        {!layer.originalVoice && (
+        {/*
+          Every applied voice can be re-pitched, including the +0 lead: changing
+          it gives that voice its own rendered clip instead of the source audio.
+        */}
+        {
           <>
             <label className="clip-field" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
               <span>Semitones</span>
@@ -856,10 +860,20 @@ function AppliedVoiceRow({
                 value={semis}
                 aria-label={`Applied voice ${index + 1} semitones`}
                 onChange={(e) => setSemis(Math.max(-24, Math.min(24, Math.round(Number(e.target.value) || 0))))}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && semis !== layer.semitones && !busy) {
+                    onRerender(layer.id, semis, buildEffects());
+                  }
+                }}
                 style={{ width: 72 }}
                 disabled={busy}
               />
             </label>
+            {semis !== layer.semitones && (
+              <span className="warning" role="status">
+                Not applied yet — press Update voice to render {semis >= 0 ? '+' : ''}{semis}.
+              </span>
+            )}
             <label className="checkbox">
               <input
                 type="checkbox"
@@ -885,12 +899,12 @@ function AppliedVoiceRow({
               className="btn btn-xs"
               aria-label={`Update harmony voice ${index + 1}, ${layer.name}`}
               onClick={() => onRerender(layer.id, semis, buildEffects())}
-              disabled={busy}
+              disabled={busy || semis === layer.semitones && !reverb && !echo && !(layer.effects ?? []).length}
             >
               Update voice
             </button>
           </>
-        )}
+        }
         <button type="button" className="btn btn-xs" aria-label={`Duplicate harmony voice ${index + 1}, ${layer.name}`} onClick={() => onDuplicate(layer.id)} disabled={busy}>Duplicate</button>
         <button type="button" className="btn btn-xs btn-danger" aria-label={`Remove harmony voice ${index + 1}, ${layer.name}`} onClick={() => onRemove(layer.id)} disabled={busy}>Remove</button>
       </span>

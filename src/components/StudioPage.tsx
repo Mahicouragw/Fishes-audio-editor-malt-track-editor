@@ -933,7 +933,15 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       cacheAudioData(asset.id, rendered);
       const delay = layer.offsetSeconds ?? 0;
       const full = rendered.length / rendered.sampleRate;
-      store.replaceHarmonyClip(layerId, asset.id, full, asset.size, label);
+      // A layer without a clip is the untouched +0 lead, which plays the source
+      // track's audio. Re-pitching it therefore has to *create* its own clip —
+      // replacing a clip that does not exist silently did nothing, so the panel
+      // could show "+12" while the audio stayed at +0.
+      if (layer.clipId) {
+        store.replaceHarmonyClip(layerId, asset.id, full, asset.size, label);
+      } else {
+        store.attachHarmonyAudio(layerId, asset.id, full, asset.size, label);
+      }
       store.updateHarmony(layerId, { semitones, effects, name: label, clipDuration: full });
       store.setHarmonyOffset(layerId, delay);
       store.announce(`${label} re-rendered`);
@@ -1256,7 +1264,11 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                 onLayerOffset={store.setHarmonyOffset}
                 onLayerPreview={handleHarmonyLayerPreview}
                 onLayerRemove={store.removeHarmony}
-                onLayerDuplicate={store.duplicateHarmony}
+                onLayerDuplicate={(layerId) => {
+                  // A failed duplicate used to be an unhandled rejection: the
+                  // button looked dead and said nothing.
+                  void store.duplicateHarmony(layerId).catch((e) => setHarmonyError((e as Error).message));
+                }}
                 onLayerRerender={handleHarmonyLayerRerender}
               />
               <RangeEffectsPanel

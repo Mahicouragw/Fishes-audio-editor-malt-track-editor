@@ -832,6 +832,68 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     });
   }, [updateProject]);
 
+  /**
+   * Give a harmony layer its own audio.
+   *
+   * The +0 "original lead" layer deliberately owns no clip — it reuses the
+   * source track's audio, so a plain +0 voice costs nothing. That works until
+   * the layer needs to be *different* from the source (a duplicate that gets
+   * pitched, or the lead itself being re-pitched): then there has to be a real
+   * clip to point at. This creates one on a new track and converts the layer
+   * into a normal rendered voice.
+   */
+  const attachHarmonyAudio = useCallback((
+    harmonyId: string,
+    assetId: string,
+    duration: number,
+    size: number,
+    name: string,
+  ): { trackId: string; clipId: string } | null => {
+    let result: { trackId: string; clipId: string } | null = null;
+    updateProject((p) => {
+      const layer = p.harmonies.find((h) => h.id === harmonyId);
+      if (!layer) return p;
+      // Already rendered: replace the existing clip instead of adding another.
+      if (layer.clipId) {
+        for (const track of p.tracks) {
+          const clip = track.clips.find((c) => c.id === layer.clipId);
+          if (!clip) continue;
+          evictAudioData(clip.assetId);
+          clip.assetId = assetId;
+          clip.duration = duration;
+          clip.name = name;
+          result = { trackId: track.id, clipId: clip.id };
+          break;
+        }
+      }
+      if (!result) {
+        const wanted = name.trim() || `${layer.name} voice`;
+        let track = p.tracks.find(
+          (t) => t.name.toLowerCase() === wanted.toLowerCase() && t.id !== layer.sourceTrackId,
+        );
+        if (!track) {
+          track = makeTrack(wanted);
+          p.tracks.push(track);
+        }
+        const clip = makeClip(assetId, name, Math.max(0, layer.offsetSeconds ?? 0), duration);
+        track.clips.push(clip);
+        result = { trackId: track.id, clipId: clip.id };
+      }
+      const attached = result as { trackId: string; clipId: string };
+      layer.clipId = attached.clipId;
+      layer.targetTrackId = attached.trackId;
+      // It is no longer the untouched lead: the source audio keeps playing on
+      // its own, and this layer now carries its own rendered audio.
+      layer.originalVoice = false;
+      layer.name = name;
+      const existing = p.media.find((m) => m.assetId === assetId);
+      if (existing) existing.name = name;
+      else p.media.push({ assetId, name, mime: 'audio/wav', size, kind: 'processed', createdAt: Date.now() });
+      return p;
+    });
+    return result;
+  }, [updateProject]);
+
   const removeHarmony = useCallback((harmonyId: string) => {
     updateProject((p) => {
       const layer = p.harmonies.find((h) => h.id === harmonyId);
@@ -851,23 +913,44 @@ export function useProjectStore(options: UseProjectOptions = {}) {
   const duplicateHarmony = useCallback(async (harmonyId: string) => {
     const project = projectRef.current;
     const layer = project.harmonies.find((h) => h.id === harmonyId);
-    if (!layer || !layer.clipId) throw new Error('Harmony layer not found');
-    const sourceClip = project.tracks.find((t) => t.clips.some((c) => c.id === layer.clipId))?.clips.find((c) => c.id === layer.clipId);
-    if (!sourceClip) throw new Error('Harmony clip not found');
+    if (!layer) throw new Error('Harmony layer not found');
+    // The +0 lead has no clip of its own — it reuses the source track's audio.
+    // Copy the source clip's audio so the duplicate is a real, pitchable voice
+    // instead of failing silently.
+    const sourceClip = layer.clipId
+      ? project.tracks.find((t) => t.clips.some((c) => c.id === layer.clipId))?.clips.find((c) => c.id === layer.clipId)
+      : project.tracks
+        .find((t) => t.id === layer.sourceTrackId)
+        ?.clips[0];
+    if (!sourceClip) throw new Error('This voice has no audio to copy yet — apply the harmony first.');
     const data = await loadAudioData(sourceClip.assetId);
     const asset = await storeAudioData(data, `${layer.name} (copy)`, 'processed');
     cacheAudioData(asset.id, data);
     updateProject((p) => {
-      const target = p.tracks.find((t) => t.id === layer.targetTrackId);
-      if (!target) return p;
-      const clip = makeClip(asset.id, `${layer.name} (copy)`, sourceClip.start, sourceClip.duration);
-      target.clips.push(clip);
+      const copyName = `${layer.name} (copy)`;
+      // Never reuse the source track: an untouched lead belongs to it, and
+      // adding a second clip there would double the song. A duplicate always
+      // gets a track of its own so it can be pitched independently.
+      let target = p.tracks.find(
+        (t) => t.name.toLowerCase() === copyName.toLowerCase() && t.id !== layer.sourceTrackId,
+      );
+      if (!target) {
+        target = makeTrack(copyName);
+        p.tracks.push(target);
+      }
+      const targetTrack = target;
+      const clip = makeClip(asset.id, copyName, sourceClip.start, sourceClip.duration);
+      targetTrack.clips.push(clip);
       p.media.push({ assetId: asset.id, name: clip.name, mime: asset.mime, size: asset.size, kind: 'processed', createdAt: Date.now() });
       p.harmonies.push({
         ...layer,
         id: makeId('harmony'),
-        name: `${layer.name} (copy)`,
+        name: copyName,
         clipId: clip.id,
+        targetTrackId: targetTrack.id,
+        // A copy is its own voice with its own audio: it must no longer be
+        // flagged as the untouched original, or it could never be re-pitched.
+        originalVoice: false,
         // A copy is its own group so replacing the preset does not delete it.
         groupId: `${layer.groupId ?? 'harmony'}:copy:${makeId('copy')}`,
       });
@@ -1047,6 +1130,7 @@ export function useProjectStore(options: UseProjectOptions = {}) {
     removeHarmonyGroup,
     setHarmonyOffset,
     replaceHarmonyClip,
+    attachHarmonyAudio,
     setHarmonyGroupMuted,
     setHarmonyGroupSolo,
     addHarmonyRange,
