@@ -206,7 +206,7 @@ export const defaultAppSettings = (): AppSettings => ({
   reduceMotion: false,
   announcements: true,
   defaultExport: defaultExportSettings(),
-  separationApiUrl: '',
+  separationApiUrl: 'https://fishes-audio-editor-malt-track.onrender.com',
   maxFileSizeMB: 250,
   masterVolume: 0.85,
 });
