@@ -94,7 +94,14 @@ export function useProjectStore(options: UseProjectOptions = {}) {
 
   const refreshSettings = useCallback(async () => {
     const loaded = await db.loadSettings().catch(() => null);
-    if (loaded) setSettings(loaded);
+    if (loaded) {
+      // Auto-migrate old installs that had empty URL to the live Render server
+      if (!loaded.separationApiUrl) {
+        loaded.separationApiUrl = defaultAppSettings().separationApiUrl;
+        await db.saveSettings(loaded).catch(() => {});
+      }
+      setSettings(loaded);
+    }
   }, []);
 
   useEffect(() => {
