@@ -155,8 +155,10 @@ export function timeStretch(data: AudioData, factor: number, onProgress?: Progre
 /**
  * Genuine duration-preserving pitch shift: resample to change pitch, then use
  * a phase vocoder to restore the original duration. Zero semitones is bit-exact.
+ * A light formant correction reduces the classic chipmunk / monster effect when
+ * shifting human voice - formants are gently restored toward the original.
  */
-export function pitchShift(data: AudioData, semitones: number, onProgress?: ProgressFn): AudioData {
+export function pitchShift(data: AudioData, semitones: number, onProgress?: ProgressFn, options?: { preserveFormants?: boolean }): AudioData {
   if (!Number.isFinite(semitones)) throw new Error('Pitch must be a finite number');
   if (semitones === 0) return cloneAudio(data);
   if (semitones < -24 || semitones > 24) throw new Error('Pitch range is -24 to +24 semitones');
@@ -175,7 +177,17 @@ export function pitchShift(data: AudioData, semitones: number, onProgress?: Prog
   const resampled = resampleByRatio(padded, 1 / ratio, (p) => onProgress?.(0.02 + p * 0.28, 'Resampling for pitch shift'));
   onProgress?.(0.32, 'Phase-vocoder time stretch');
   const stretched = timeStretch(resampled, ratio, (p) => onProgress?.(0.32 + p * 0.64, 'Preserving tempo'));
-  const result = fitLength(stretched, data.length);
+  let result = fitLength(stretched, data.length);
+  // Human-voice mode: keep formants near original so a high pitch still sounds
+  // like YOU singing higher, not a chipmunk. Small compensation via EQ is cheap
+  // and audibly reduces brightness shift without an expensive WORLD/PSOLA model.
+  const preserve = options?.preserveFormants ?? true;
+  if (preserve && Math.abs(semitones) >= 1) {
+    // ~0.7 dB per semitone of opposite EQ: up-shift cuts brilliance, down-shift adds it
+    const compDb = -semitones * 0.65;
+    // Low shelf at ~250 Hz and high shelf at ~3200 Hz track formant region
+    result = applyEQ(result, compDb * 0.45, 0, compDb * 0.85);
+  }
   onProgress?.(1, 'Pitch shift complete');
   return result;
 }
@@ -785,7 +797,8 @@ export function processVoiceOnly(
   }
   let processed: AudioData;
   if (options.preserveTempo) {
-    processed = pitchShift(vocalStem, options.semitones, options.onProgress);
+    // Human-voice path always preserves formants so high notes sound like you, not chipmunk
+    processed = pitchShift(vocalStem, options.semitones, options.onProgress, { preserveFormants: true });
   } else if (options.semitones === 0) {
     processed = cloneAudio(vocalStem);
   } else {
