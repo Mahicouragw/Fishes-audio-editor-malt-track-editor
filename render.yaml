@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: fishes-audio-editor-malt-track
+    runtime: docker
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
+    env: docker
+    plan: free
+    branch: main
+    autoDeploy: false
+    envVars:
+      - key: DEMUCS_MODEL
+        value: htdemucs
+      - key: CORS_ORIGINS
+        value: https://mahicouragw.github.io,http://localhost:5173
+      - key: MAX_UPLOAD_MB
+        value: 250
+      - key: CLEANUP_MINUTES
+        value: 30
+      - key: PORT
+        value: 8000
