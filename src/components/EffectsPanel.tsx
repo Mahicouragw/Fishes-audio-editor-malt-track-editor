@@ -11,7 +11,7 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
   track: Track;
   busy: boolean;
   onPitch: (semis: number, cents: number) => void;
-  onPreviewPitch: (semis: number) => void;
+  onPreviewPitch: (semis: number, cents: number) => void;
   onPreviewOriginal: () => void;
   onVolume: (v: number) => void;
   onMute: () => void; onSolo: () => void; onRename: (n: string) => void; onDuplicate: () => void; onDelete: () => void;
@@ -25,6 +25,10 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
     setPendingSemis(track.pitchSemis);
     setPendingCents(track.pitchFineCents);
   }, [track.pitchSemis, track.pitchFineCents, track.id]);
+
+  useEffect(() => {
+    setName(track.name);
+  }, [track.id, track.name]);
 
   const dirty = pendingSemis !== track.pitchSemis || pendingCents !== track.pitchFineCents;
 
@@ -62,7 +66,7 @@ export function TrackControls({ track, busy, onPitch, onPreviewPitch, onPreviewO
           <input type="range" min={-50} max={50} step={1} value={pendingCents} aria-label={`${track.name} fine tuning, ${pendingCents} cents`} disabled={busy} onChange={(e) => setPendingCents(Number(e.target.value))} />
         </label>
         <div className="row" aria-live="polite">
-          <button type="button" className="btn" aria-label={`Preview ${track.name} at ${describeSemis(pendingSemis)}`} disabled={busy} onClick={() => onPreviewPitch(pendingSemis)}>Preview</button>
+          <button type="button" className="btn" aria-label={`Preview ${track.name} at ${describeSemis(pendingSemis)}${pendingCents ? ` ${pendingCents > 0 ? '+' : ''}${pendingCents} cents` : ''}`} disabled={busy} onClick={() => onPreviewPitch(pendingSemis, pendingCents)}>Preview</button>
           <button type="button" className="btn" aria-label={`Preview ${track.name} at original pitch`} disabled={busy} onClick={onPreviewOriginal}>Preview original</button>
           <button type="button" className="btn btn-primary" aria-label={`Apply pitch ${describeSemis(pendingSemis)} to ${track.name}`} disabled={busy || !dirty} onClick={() => onPitch(pendingSemis, pendingCents)}>Apply</button>
           <button type="button" className="btn" aria-label={`Cancel pitch change on ${track.name}`} disabled={busy || !dirty} onClick={() => { setPendingSemis(track.pitchSemis); setPendingCents(track.pitchFineCents); }}>Cancel</button>
@@ -156,6 +160,16 @@ export function HarmonyPanel({ tracks, harmonies, onCreate, onPreview, onMute, o
   const [semis, setSemis] = useState(7);
   const [custom, setCustom] = useState('');
   const [vocalsOnly, setVocalsOnly] = useState(false);
+
+  // Keep selectors valid when tracks are added, removed or renamed
+  useEffect(() => {
+    const ids = new Set(tracks.map((t) => t.id));
+    if (!ids.has(source)) setSource(tracks[0]?.id ?? '');
+    if (!ids.has(target) || target === source) {
+      const next = tracks.find((t) => t.id !== source)?.id ?? '';
+      if (next !== target) setTarget(next);
+    }
+  }, [tracks, source, target]);
 
   const trackName = (id: string) => tracks.find((t) => t.id === id)?.name ?? 'Unknown track';
   const effectiveTarget = target === source ? (tracks.find((t) => t.id !== source)?.id ?? '') : target;

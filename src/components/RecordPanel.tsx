@@ -75,7 +75,9 @@ export function RecordPanel({ store, position }: { store: ProjectStore; position
         // Karaoke placement: takes go to the chosen position (defaults to the
         // playhead). Replace-take removes the previous take at that position so
         // retakes stay aligned with the accompaniment.
-        let at = Math.max(0, startPosition);
+        // Compensate estimated input latency first so both the search and the
+        // insertion use the same latency-corrected timeline position.
+        let at = Math.max(0, startPosition - result.latencySeconds);
         if (replaceTake) {
           for (const take of store.project.recordings) {
             if (take.trackId === target && Math.abs(take.start - at) < 0.05) {
@@ -83,8 +85,6 @@ export function RecordPanel({ store, position }: { store: ProjectStore; position
             }
           }
         }
-        // Compensate estimated input latency so the take lines up with the click.
-        at = Math.max(0, at - result.latencySeconds);
         await store.importAudioData(result.data, `Take ${new Date().toLocaleTimeString()}`, target, at, { recording: true });
         store.announce(`Recording saved at ${formatTime(at)}: ${formatTime(result.duration)}`);
         setStatus(`Saved ${formatTime(result.duration)} at ${formatTime(at)}`);
