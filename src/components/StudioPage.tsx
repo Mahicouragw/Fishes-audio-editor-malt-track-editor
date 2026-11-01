@@ -295,11 +295,11 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   }, [playPreview, selectedTrack]);
 
   /** Preview a whole track, optionally with a temporary pitch (before committing it). */
-  const previewTrack = useCallback(async (track: Track, semisOverride?: number) => {
+  const previewTrack = useCallback(async (track: Track, semisOverride?: number, centsOverride?: number) => {
     setError('');
     if (!track.clips.length) { setError(`${track.name} has no audio to preview`); return; }
     try {
-      const simulated: Track = semisOverride === undefined ? track : { ...track, pitchSemis: semisOverride, pitchFineCents: 0 };
+      const simulated: Track = semisOverride === undefined ? track : { ...track, pitchSemis: semisOverride, pitchFineCents: centsOverride ?? 0 };
       const rendered: ScheduledClip[] = [];
       for (let i = 0; i < track.clips.length; i++) {
         const clip = track.clips[i];
@@ -319,7 +319,8 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       setPrep({ busy: false, progress: 0, message: '' });
       setPlaying(true);
       setPaused(false);
-      store.announce(semisOverride === undefined ? `Preview: ${track.name}` : `Preview: ${track.name} at ${semisOverride >= 0 ? '+' : ''}${semisOverride} semitones (not applied yet)`);
+      const centsLabel = centsOverride ? ` ${centsOverride > 0 ? '+' : ''}${centsOverride} cents` : '';
+      store.announce(semisOverride === undefined ? `Preview: ${track.name}` : `Preview: ${track.name} at ${semisOverride >= 0 ? '+' : ''}${semisOverride} semitones${centsLabel} (not applied yet)`);
     } catch (e) {
       setPrep({ busy: false, progress: 0, message: '' });
       setError((e as Error).message);
@@ -604,7 +605,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
                     track={selectedTrack}
                     busy={prep.busy || dsp.busy}
                     onPitch={(s, c) => handleTrackPitch(selectedTrack.id, s, c)}
-                    onPreviewPitch={(s) => previewTrack(selectedTrack, s)}
+                    onPreviewPitch={(s, c) => previewTrack(selectedTrack, s, c)}
                     onPreviewOriginal={() => previewTrack(selectedTrack)}
                     onVolume={(v) => store.setTrackVolume(selectedTrack.id, v)}
                     onMute={() => store.toggleMute(selectedTrack.id)}

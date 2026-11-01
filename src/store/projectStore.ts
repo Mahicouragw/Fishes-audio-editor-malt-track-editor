@@ -242,13 +242,18 @@ export function useProjectStore(options: UseProjectOptions = {}) {
 
   // Track helpers
   const addTrack = useCallback((name?: string) => {
+    let newTrackId = '';
     updateProject((p) => {
       const count = p.tracks.length + 1;
-      p.tracks.push(makeTrack(name ?? `Voice ${count}`));
+      const track = makeTrack(name ?? `Voice ${count}`);
+      newTrackId = track.id;
+      p.tracks.push(track);
       return p;
     });
+    // Auto-select the new track so karaoke / recording lands where the user expects
+    if (newTrackId) updateView({ selectedTrackId: newTrackId });
     announce('Track added');
-  }, [announce, updateProject]);
+  }, [announce, updateProject, updateView]);
 
   const renameTrack = useCallback((trackId: string, name: string) => {
     updateProject((p) => {
@@ -266,7 +271,12 @@ export function useProjectStore(options: UseProjectOptions = {}) {
       const copy = cloneProject(source as unknown as Project) as unknown as Track;
       copy.id = makeId('track');
       copy.name = `${source.name} copy`;
-      copy.clips = source.clips.map((c) => ({ ...c, id: makeId('clip') }));
+      // Deep-clone clips so editing effects on the duplicate never mutates the original
+      copy.clips = source.clips.map((c) => ({
+        ...c,
+        id: makeId('clip'),
+        effects: c.effects.map((e) => ({ ...e, params: { ...e.params } })),
+      }));
       p.tracks.splice(index + 1, 0, copy);
       return p;
     });

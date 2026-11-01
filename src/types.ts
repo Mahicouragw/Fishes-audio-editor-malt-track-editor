@@ -244,8 +244,12 @@ export const projectDuration = (project: Project, assetLengths: Map<string, numb
   let end = 0;
   for (const track of project.tracks) {
     for (const clip of track.clips) {
-      const sourceLength = assetLengths.get(clip.assetId) ?? clip.duration;
-      const playable = Math.max(0, Math.min(clip.duration, sourceLength - clip.sourceStart));
+      const sourceLength = assetLengths.get(clip.assetId);
+      // When asset length is known we must not play past the source; otherwise
+      // the clip's own duration is authoritative (sourceStart is just an offset).
+      const playable = sourceLength !== undefined
+        ? Math.max(0, Math.min(clip.duration, sourceLength - clip.sourceStart))
+        : clip.duration;
       end = Math.max(end, clip.start + playable);
     }
   }

@@ -40,6 +40,14 @@ export function ExportDialog({ store, onClose }: { store: ProjectStore; onClose:
   const selection = store.project.selection;
   const urlsRef = useRef<Map<string, string>>(new Map());
 
+  // Persist export preferences so reopening the dialog restores the last choices
+  useEffect(() => {
+    store.updateProject((p) => {
+      p.exportSettings = { format, scope, filename, sampleRate, bitDepth, bitrate, channels, normalize: normalizeOut, preventClipping };
+      return p;
+    }, false);
+  }, [format, scope, filename, sampleRate, bitDepth, bitrate, channels, normalizeOut, preventClipping, store]);
+
   // Revoke object URLs when the dialog closes; a new export revokes the
   // previous set explicitly (below) so links never dangle mid-export.
   useEffect(() => () => {

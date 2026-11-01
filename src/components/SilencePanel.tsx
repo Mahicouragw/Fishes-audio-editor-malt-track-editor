@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import type { SilenceRegion } from '../audio/dsp';
 import { useDsp } from '../audio/useDsp';
 import { formatTime } from '../types';
@@ -16,6 +16,13 @@ export function SilencePanel({ store }: { store: ProjectStore }) {
   const [analysedAssetId, setAnalysedAssetId] = useState<string | null>(null);
   const dsp = useDsp();
   const busy = dsp.busy;
+
+  useEffect(() => {
+    const ids = new Set(store.project.tracks.map((t) => t.id));
+    if (!ids.has(trackId) && store.project.tracks[0]) {
+      setTrackId(store.project.tracks[0].id);
+    }
+  }, [store.project.tracks, trackId]);
 
   const target = store.project.tracks.find((t) => t.id === trackId) ?? store.project.tracks[0];
 

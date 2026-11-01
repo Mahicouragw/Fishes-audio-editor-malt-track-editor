@@ -349,9 +349,9 @@ export function applyReverb(
   mix: number,
   includeTailSeconds = 0,
 ): AudioData {
-  const scale = data.sampleRate / 44100;
-  const delays = [29.7, 37.1, 41.1, 43.7].map((ms) => Math.max(4, Math.round((ms * scale))));
-  const allpassDelays = [5.0, 1.7].map((ms) => Math.max(2, Math.round(ms * scale)));
+  // Delays are real milliseconds converted to samples; scale adapts to the project's sample rate.
+  const delays = [29.7, 37.1, 41.1, 43.7].map((ms) => Math.max(4, Math.round((ms * data.sampleRate) / 1000)));
+  const allpassDelays = [5.0, 1.7].map((ms) => Math.max(2, Math.round((ms * data.sampleRate) / 1000)));
   const room = clamp(reverbSeconds / 3, 0.1, 1);
   const feedbacks = delays.map((_, i) => clamp(0.7 + room * 0.22 - i * 0.006, 0.5, 0.93));
   const tail = Math.max(0, Math.round(includeTailSeconds * data.sampleRate));
