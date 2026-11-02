@@ -47,11 +47,12 @@ export function SettingsPage({ store }: { store: ProjectStore }) {
         </div>
       </section>
 
-      <section className="panel" aria-label="Vocal separation">
+      {/* Vocal separation URL is hidden from users but still used internally (live Render server) */}
+      <section className="panel" aria-label="Vocal separation" style={{ display: 'none' }} aria-hidden="true">
         <h2>Vocal separation</h2>
-        <p className="hint">Local approximate isolation runs entirely in this browser. For higher quality, run a Demucs server (see server/README.md) and set its URL below.</p>
+        <p className="hint">Powered by your live generate server.</p>
         <label className="field">
-          <span>Demucs server URL (optional)</span>
+          <span>Demucs server URL</span>
           <input type="url" value={store.settings.separationApiUrl} placeholder="https://your-server.example.com" aria-label="Demucs server URL" onChange={(e) => store.updateSettings({ separationApiUrl: e.target.value })} />
         </label>
       </section>
