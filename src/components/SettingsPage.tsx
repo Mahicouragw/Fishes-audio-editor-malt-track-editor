@@ -47,14 +47,24 @@ export function SettingsPage({ store }: { store: ProjectStore }) {
         </div>
       </section>
 
-      {/* Vocal separation URL is hidden from users but still used internally (live Render server) */}
-      <section className="panel" aria-label="Vocal separation" style={{ display: 'none' }} aria-hidden="true">
-        <h2>Vocal separation</h2>
-        <p className="hint">Powered by your live generate server.</p>
+      <section className="panel" aria-label="Vocal separation">
+        <h2>Vocal separation — Backing fix</h2>
+        <p className="hint">Backing (instrumental) now uses <strong>real Demucs server</strong>, not local. If server is sleeping, we wake it (30-60s) then retry — no more instant local fallback that causes chipmunk.</p>
         <label className="field">
-          <span>Demucs server URL</span>
-          <input type="url" value={store.settings.separationApiUrl} placeholder="https://your-server.example.com" aria-label="Demucs server URL" onChange={(e) => store.updateSettings({ separationApiUrl: e.target.value })} />
+          <span>Demucs server URL (backing source)</span>
+          <input type="url" value={store.settings.separationApiUrl} placeholder="https://fishes-audio-editor-malt-track.onrender.com" aria-label="Demucs server URL" onChange={(e) => store.updateSettings({ separationApiUrl: e.target.value })} />
         </label>
+        <p className="hint">
+          Default: <a href="https://fishes-audio-editor-malt-track.onrender.com/health" target="_blank" rel="noopener">https://fishes-audio-editor-malt-track.onrender.com/health</a> —
+          <a href="https://fishes-audio-editor-malt-track.onrender.com/docs" target="_blank" rel="noopener"> /docs</a> —
+          <a href="https://fishes-audio-editor-malt-track.onrender.com/" target="_blank" rel="noopener"> / (root)</a> |
+          <a href="https://dashboard.render.com/" target="_blank" rel="noopener"> Render dashboard</a> |
+          <button type="button" className="btn btn-xs" onClick={async () => {
+            const url = store.settings.separationApiUrl.replace(/\/$/, '') + '/health';
+            try { const r = await fetch(url); const j = await r.json(); alert(`✅ Server UP: ${JSON.stringify(j)}`); } catch (e) { alert(`❌ Server down/sleeping: ${(e as Error).message} — Render free tier sleeps after 15m, first request wakes it in ~60s. Try again.`); }
+          }}>Check server now</button>
+        </p>
+        <p className="hint">Backing tracks: when separation shows <em>Method: Demucs server</em> = real backing. If it shows <em>local approximate</em> = fallback — record 2+ sec clear voice, and ensure server is awake via links above.</p>
       </section>
 
       <section className="panel" aria-label="Theme and accessibility">

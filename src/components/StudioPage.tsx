@@ -392,27 +392,41 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       let instrumental: AudioData;
       let meta: { quality: number; method: 'local-approximate' | 'demucs-server'; message: string; warning?: string };
       const apiUrl = store.settings.separationApiUrl.trim();
+      // Fix backing: ensure real Demucs server is used, with Render wake-up retry (free tier sleeps after 15m)
+      const wakeAndRetry = async (base: string): Promise<boolean> => {
+        for (let i = 0; i < 3; i++) {
+          try {
+            const h = await fetch(`${base}/health`, { signal: AbortSignal.timeout(7000) });
+            if (h.ok) return true;
+          } catch {}
+          // Render cold start 30-60s — wait and retry, show progress
+          store.setVocalState(trackId, { status: 'processing', warning: `Waking backing server (${i + 1}/3)… check https://fishes-audio-editor-malt-track.onrender.com/health` });
+          await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+        }
+        return false;
+      };
       // Short clips: skip server entirely to avoid 500 "too short" error
       if (apiUrl && !shouldUseLocalOnly) {
-        const data = await loadAudioData(clip.assetId);
-        const blob = encodeWavBlob(data, { bitDepth: 16, channels: data.channels.length >= 2 ? 2 : 1 });
-        const form = new FormData();
-        form.append('file', blob, 'track.wav');
         const base = apiUrl.replace(/\/$/, '');
-        let response: Response;
-        try {
-          response = await fetch(`${base}/separate`, { method: 'POST', body: form });
-        } catch (e) {
-          console.warn('Server unreachable, using local:', e);
-          // Network error - fallback to local instead of failing
-          const localData = await loadAudioData(clip.assetId);
-          const outcome = await dsp.run({ kind: 'separate', data: localData });
+        // Ask to upload to server BEFORE processing - user clicks OK to use real server
+        const serverOk = window.confirm(
+          `Upload to server for REAL vocal separation?\n\n` +
+          `Clip: ${checkedDur.toFixed(1)}s (${trackName})\n` +
+          `Server: ${base}/separate\n\n` +
+          `OK = Upload to server (real Demucs backing, no chipmunk)\n` +
+          `Cancel = Use local fallback (37%, may chipmunk)\n\n` +
+          `Server will be woken if sleeping (30-60s). You can check:\n` +
+          `${base}/health`
+        );
+        if (!serverOk) {
+          // User chose local - use local directly
+          const data = await loadAudioData(clip.assetId);
+          const outcome = await dsp.run({ kind: 'separate', data });
           const separation = (outcome.result ?? outcome.data) as SeparationResult | undefined;
-          if (!separation || !separation.vocal) throw new Error(`Server unreachable and local fallback failed`);
+          if (!separation || !separation.vocal) throw new Error('Local separation produced no stems');
           vocal = separation.vocal;
           instrumental = separation.instrumental;
-          meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: 'Server unreachable — used local separation (37% is normal for short clips, record 2+ sec for better)' };
-          // Skip to saving
+          meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: `You chose local for ${checkedDur.toFixed(1)}s clip — for real server backing, run again and click OK to upload to ${base}` };
           const vocalAsset = await storeAudioData(vocal, `${trackName} vocals`, 'processed');
           const instAsset = await storeAudioData(instrumental, `${trackName} instrumental`, 'processed');
           cacheAudioData(vocalAsset.id, vocal);
@@ -428,7 +442,56 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             warning: meta.warning,
             error: undefined,
           });
-          store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence)`);
+          store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence) — local as requested`);
+          return;
+        }
+        // User clicked OK - upload to real server with wake retry
+        const data = await loadAudioData(clip.assetId);
+        const blob = encodeWavBlob(data, { bitDepth: 16, channels: data.channels.length >= 2 ? 2 : 1 });
+        const form = new FormData();
+        form.append('file', blob, 'track.wav');
+        let response: Response | null = null;
+        let lastErr: unknown = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            store.setVocalState(trackId, { status: 'processing', warning: `Uploading ${checkedDur.toFixed(1)}s to server for REAL separation...` });
+            response = await fetch(`${base}/separate`, { method: 'POST', body: form });
+            break;
+          } catch (e) {
+            lastErr = e;
+            console.warn(`Backing server attempt ${attempt + 1} failed, waking:`, e);
+            if (attempt === 0) {
+              const woke = await wakeAndRetry(base);
+              if (!woke) continue;
+            }
+          }
+        }
+        if (!response) {
+          console.warn('Server unreachable after retry, using local:', lastErr);
+          // Only fallback to local after wake retries — prevents chipmunk from premature local
+          const localData = await loadAudioData(clip.assetId);
+          const outcome = await dsp.run({ kind: 'separate', data: localData });
+          const separation = (outcome.result ?? outcome.data) as SeparationResult | undefined;
+          if (!separation || !separation.vocal) throw new Error(`Backing server unreachable after wake retries (${base}/health). Check https://fishes-audio-editor-malt-track.onrender.com/health — Render free tier sleeps, first request takes 60s. Local fallback failed too.`);
+          vocal = separation.vocal;
+          instrumental = separation.instrumental;
+          meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: 'Backing server sleeping/unreachable — used local (37%). Wake it: open https://fishes-audio-editor-malt-track.onrender.com/health and retry. Record 2+ sec clear voice for best real backing.' };
+          const vocalAsset = await storeAudioData(vocal, `${trackName} vocals`, 'processed');
+          const instAsset = await storeAudioData(instrumental, `${trackName} instrumental`, 'processed');
+          cacheAudioData(vocalAsset.id, vocal);
+          cacheAudioData(instAsset.id, instrumental);
+          store.setVocalState(trackId, {
+            status: 'ready',
+            method: meta.method,
+            vocalAssetId: vocalAsset.id,
+            instrumentalAssetId: instAsset.id,
+            separatedFromAssetId: clip.assetId,
+            quality: meta.quality,
+            qualityMessage: meta.message,
+            warning: meta.warning,
+            error: undefined,
+          });
+          store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence) — backing was local, wake server for real backing`);
           return;
         }
         if (!response.ok) {
@@ -442,7 +505,8 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             if (!separation || !separation.vocal) throw new Error(`Server: ${text} — and local fallback also failed`);
             vocal = separation.vocal;
             instrumental = separation.instrumental;
-            meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: `Used local separation for ${checkedDur.toFixed(1)}s clip — server is for 1-2s+ clear voice. Your 1:07 real recording will use server next time.` };
+            // Fix for 67.3s showing wrong short-clip warning - make it duration-aware
+            meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: checkedDur < 1.2 ? `Used local for ${checkedDur.toFixed(1)}s short clip — server needs 1-2s+.` : `Server error for ${checkedDur.toFixed(1)}s — used local fallback. Server may be sleeping: open ${base}/health, wait 60s, then retry and click OK for REAL Demucs backing.` };
           } else {
             throw new Error(`Separation server error: ${response.status} ${text}`);
           }
