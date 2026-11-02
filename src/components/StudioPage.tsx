@@ -496,19 +496,20 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         }
         if (!response.ok) {
           const text = await response.text();
-          // Friendly fallback - don't show raw JSON to user (fixes scary green box)
-          if (text.includes('too short') || text.includes('contain no audio') || text.includes('Demucs did not produce') || response.status === 500) {
-            console.warn('Server separation failed, falling back to local:', text);
+          // You clicked OK for REAL server — don't silently fallback. Show real error.
+          // Only auto-fallback for true short-clip cases; for 67.3s we must show the server error.
+          if ((text.includes('too short') || text.includes('contain no audio') || text.includes('Demucs did not produce')) && checkedDur < 1.2) {
+            console.warn('Server separation failed for short clip, falling back to local:', text);
             const localData = await loadAudioData(clip.assetId);
             const outcome = await dsp.run({ kind: 'separate', data: localData });
             const separation = (outcome.result ?? outcome.data) as SeparationResult | undefined;
             if (!separation || !separation.vocal) throw new Error(`Server: ${text} — and local fallback also failed`);
             vocal = separation.vocal;
             instrumental = separation.instrumental;
-            // Fix for 67.3s showing wrong short-clip warning - make it duration-aware
-            meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: checkedDur < 1.2 ? `Used local for ${checkedDur.toFixed(1)}s short clip — server needs 1-2s+.` : `Server error for ${checkedDur.toFixed(1)}s — used local fallback. Server may be sleeping: open ${base}/health, wait 60s, then retry and click OK for REAL Demucs backing.` };
+            meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: `Used local for ${checkedDur.toFixed(1)}s short clip — server needs 1-2s+.` };
           } else {
-            throw new Error(`Separation server error: ${response.status} ${text}`);
+            // For your 67.3s, throw real server error (no duplicate local warning) — retry after waking
+            throw new Error(`Server error for ${checkedDur.toFixed(1)}s (${response.status}): ${text} — server may be sleeping. Open ${base}/health, wait 60s, then retry and click OK. Not using local fallback as you requested REAL.`);
           }
         } else {
           const result = (await response.json()) as { vocalUrl?: string; instrumentalUrl?: string; quality?: number; message?: string };
