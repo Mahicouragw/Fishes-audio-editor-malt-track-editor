@@ -177,6 +177,26 @@ async def separate(
     output_dir = job_dir / "separated"
     output_dir.mkdir(exist_ok=True)
 
+    # Handle very short recordings (e.g. 042 seconds / 0.42s) - Demucs needs ~1s minimum. Pad with silence if needed.
+    try:
+        import soundfile as sf_check
+        try:
+            _data_check, _sr_check = sf_check.read(str(input_path))
+            _duration = len(_data_check) / float(_sr_check or 44100)
+            if _duration < 1.0:
+                # Pad to 1.2s with silence so Demucs can produce stems
+                import numpy as _np
+                _pad_len = int((1.2 - _duration) * _sr_check)
+                if _data_check.ndim == 1:
+                    _padded = _np.concatenate([_data_check, _np.zeros(_pad_len, dtype=_data_check.dtype)])
+                else:
+                    _padded = _np.concatenate([_data_check, _np.zeros((_pad_len, _data_check.shape[1]), dtype=_data_check.dtype)], axis=0)
+                sf_check.write(str(input_path), _padded, _sr_check)
+        except Exception:
+            pass  # If check fails, try Demucs anyway
+    except Exception:
+        pass
+
     try:
         await asyncio.wait_for(asyncio.to_thread(run_demucs, input_path, output_dir, MODEL), timeout=300)
     except asyncio.TimeoutError:
@@ -194,7 +214,8 @@ async def separate(
     other = output_dir / "other.wav"
 
     if not vocals.exists():
-        raise HTTPException(status_code=500, detail="Demucs did not produce vocals stem — file may be too short or contain no audio")
+        # For very short/quiet recordings, demucs may silently fail - provide helpful guidance
+        raise HTTPException(status_code=500, detail="Demucs did not produce vocals stem — file may be too short (<1s) or contain no audio/silence. Try recording at least 1-2 seconds with clear voice, not silence.")
 
     def file_url(p: Path) -> Optional[str]:
         return f"/files/{job_id}/separated/{p.name}" if p.exists() else None
