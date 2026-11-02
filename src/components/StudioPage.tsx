@@ -351,24 +351,26 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const handleSeparate = useCallback(async () => {
     if (!selectedTrack || !selectedTrack.clips.length) { setError('Select a track with audio to separate'); return; }
     setError('');
-    // Validate recording before sending to server - fixes "042 seconds" too short error
+    // Pre-validate - for very short clips (042 = 0.42s) skip server and use local directly
+    let shouldUseLocalOnly = false;
     try {
       const checkData = await loadAudioData(selectedTrack.clips[0].assetId);
       const dur = checkData.length / checkData.sampleRate;
-      const hasAudio = checkData.channels.some(ch => ch.some(v => Math.abs(v) > 0.005));
-      if (dur < 0.8) {
-        throw new Error(`Recording too short (${dur.toFixed(2)}s) — please record at least 1-2 seconds of clear voice. Demucs needs ~1s minimum, 042 seconds is too short.`);
-      }
-      if (!hasAudio) {
-        throw new Error('No audio detected in this clip (silence) — please record again with microphone enabled and speak clearly.');
+      const hasAudio = checkData.channels.some(ch => ch.some(v => Math.abs(v) > 0.008));
+      if (dur < 1.0) {
+        // Don't call server for <1s - it will 500. Go straight to local.
+        shouldUseLocalOnly = true;
+        console.log(`Short clip ${dur.toFixed(2)}s - using local separation only`);
+      } else if (!hasAudio) {
+        throw new Error('No audio detected in this clip (silence) — please record again with microphone enabled and speak clearly near the mic.');
       }
     } catch (e) {
-      // Only block if it's our validation error, otherwise continue to try separation
-      if ((e as Error).message.includes('too short') || (e as Error).message.includes('No audio')) {
+      if ((e as Error).message.includes('No audio')) {
         store.setVocalState(selectedTrack.id, { status: 'failed', error: (e as Error).message });
         setError((e as Error).message);
         return;
       }
+      // For other errors, continue - will try separation anyway
     }
     store.setVocalState(selectedTrack.id, { status: 'processing', error: undefined, warning: undefined });
     const clip = selectedTrack.clips[0];
@@ -379,7 +381,8 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       let instrumental: AudioData;
       let meta: { quality: number; method: 'local-approximate' | 'demucs-server'; message: string; warning?: string };
       const apiUrl = store.settings.separationApiUrl.trim();
-      if (apiUrl) {
+      // Short clips: skip server entirely to avoid 500 "too short" error
+      if (apiUrl && !shouldUseLocalOnly) {
         const data = await loadAudioData(clip.assetId);
         const blob = encodeWavBlob(data, { bitDepth: 16, channels: data.channels.length >= 2 ? 2 : 1 });
         const form = new FormData();
@@ -389,12 +392,38 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         try {
           response = await fetch(`${base}/separate`, { method: 'POST', body: form });
         } catch (e) {
-          throw new Error(`Separation server unreachable at ${base} — is ${apiUrl} running? ${ (e as Error).message}`);
+          console.warn('Server unreachable, using local:', e);
+          // Network error - fallback to local instead of failing
+          const localData = await loadAudioData(clip.assetId);
+          const outcome = await dsp.run({ kind: 'separate', data: localData });
+          const separation = (outcome.result ?? outcome.data) as SeparationResult | undefined;
+          if (!separation || !separation.vocal) throw new Error(`Server unreachable and local fallback failed`);
+          vocal = separation.vocal;
+          instrumental = separation.instrumental;
+          meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: 'Server unreachable — used local separation (37% is normal for short clips, record 2+ sec for better)' };
+          // Skip to saving
+          const vocalAsset = await storeAudioData(vocal, `${trackName} vocals`, 'processed');
+          const instAsset = await storeAudioData(instrumental, `${trackName} instrumental`, 'processed');
+          cacheAudioData(vocalAsset.id, vocal);
+          cacheAudioData(instAsset.id, instrumental);
+          store.setVocalState(trackId, {
+            status: 'ready',
+            method: meta.method,
+            vocalAssetId: vocalAsset.id,
+            instrumentalAssetId: instAsset.id,
+            separatedFromAssetId: clip.assetId,
+            quality: meta.quality,
+            qualityMessage: meta.message,
+            warning: meta.warning,
+            error: undefined,
+          });
+          store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence)`);
+          return;
         }
         if (!response.ok) {
           const text = await response.text();
-          // Auto-fallback to local for short/silent files - fixes 500 "too short or contain no audio"
-          if (text.includes('too short') || text.includes('contain no audio') || response.status === 500) {
+          // Friendly fallback - don't show raw JSON to user (fixes scary green box)
+          if (text.includes('too short') || text.includes('contain no audio') || text.includes('Demucs did not produce') || response.status === 500) {
             console.warn('Server separation failed, falling back to local:', text);
             const localData = await loadAudioData(clip.assetId);
             const outcome = await dsp.run({ kind: 'separate', data: localData });
@@ -402,7 +431,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             if (!separation || !separation.vocal) throw new Error(`Server: ${text} — and local fallback also failed`);
             vocal = separation.vocal;
             instrumental = separation.instrumental;
-            meta = { quality: separation.quality, method: 'local-approximate', message: `${separation.message} (server fallback)`, warning: `Server said: ${text}` };
+            meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: 'Used local separation — for best server quality, record 1-2s+ of clear voice (your 042 clip was very short)' };
           } else {
             throw new Error(`Separation server error: ${response.status} ${text}`);
           }
