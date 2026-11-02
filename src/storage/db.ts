@@ -1,20 +1,44 @@
 import type { Project, AppSettings, StoredAsset } from '../types';
 
 const DB_NAME = 'wishes-audio-editor';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onupgradeneeded = () => {
+    const handleUpgrade = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains('projects')) db.createObjectStore('projects', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('assets')) db.createObjectStore('assets', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('recent')) db.createObjectStore('recent', { keyPath: 'id' });
     };
+    request.onupgradeneeded = handleUpgrade;
+    request.onblocked = () => {
+      // Another tab holds the old version - warn but still resolve when it closes
+      console.warn('IndexedDB upgrade blocked by another tab');
+    };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onerror = () => {
+      const err = request.error as DOMException | null;
+      // Fix for your error: "The requested version (2) is less than the existing version (3)"
+      // This happens when the browser already has DB v3 but code requests v2 (downgrade).
+      // Recovery: delete and recreate with current version.
+      if (err?.name === 'VersionError') {
+        const del = indexedDB.deleteDatabase(DB_NAME);
+        del.onsuccess = () => {
+          const retry = indexedDB.open(DB_NAME, DB_VERSION);
+          retry.onupgradeneeded = handleUpgrade;
+          retry.onblocked = () => console.warn('Retry blocked');
+          retry.onsuccess = () => resolve(retry.result);
+          retry.onerror = () => reject(retry.error);
+        };
+        del.onerror = () => reject(err);
+        del.onblocked = () => reject(err);
+      } else {
+        reject(request.error);
+      }
+    };
   });
 }
 
