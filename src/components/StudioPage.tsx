@@ -392,6 +392,19 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       let instrumental: AudioData;
       let meta: { quality: number; method: 'local-approximate' | 'demucs-server'; message: string; warning?: string };
       const apiUrl = store.settings.separationApiUrl.trim();
+      // Fix backing: ensure real Demucs server is used, with Render wake-up retry (free tier sleeps after 15m)
+      const wakeAndRetry = async (base: string): Promise<boolean> => {
+        for (let i = 0; i < 3; i++) {
+          try {
+            const h = await fetch(`${base}/health`, { signal: AbortSignal.timeout(7000) });
+            if (h.ok) return true;
+          } catch {}
+          // Render cold start 30-60s — wait and retry, show progress
+          store.setVocalState(trackId, { status: 'processing', warning: `Waking backing server (${i + 1}/3)… check https://fishes-audio-editor-malt-track.onrender.com/health` });
+          await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+        }
+        return false;
+      };
       // Short clips: skip server entirely to avoid 500 "too short" error
       if (apiUrl && !shouldUseLocalOnly) {
         const data = await loadAudioData(clip.assetId);
@@ -399,20 +412,31 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         const form = new FormData();
         form.append('file', blob, 'track.wav');
         const base = apiUrl.replace(/\/$/, '');
-        let response: Response;
-        try {
-          response = await fetch(`${base}/separate`, { method: 'POST', body: form });
-        } catch (e) {
-          console.warn('Server unreachable, using local:', e);
-          // Network error - fallback to local instead of failing
+        let response: Response | null = null;
+        let lastErr: unknown = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            response = await fetch(`${base}/separate`, { method: 'POST', body: form });
+            break;
+          } catch (e) {
+            lastErr = e;
+            console.warn(`Backing server attempt ${attempt + 1} failed, waking:`, e);
+            if (attempt === 0) {
+              const woke = await wakeAndRetry(base);
+              if (!woke) continue;
+            }
+          }
+        }
+        if (!response) {
+          console.warn('Server unreachable after retry, using local:', lastErr);
+          // Only fallback to local after wake retries — prevents chipmunk from premature local
           const localData = await loadAudioData(clip.assetId);
           const outcome = await dsp.run({ kind: 'separate', data: localData });
           const separation = (outcome.result ?? outcome.data) as SeparationResult | undefined;
-          if (!separation || !separation.vocal) throw new Error(`Server unreachable and local fallback failed`);
+          if (!separation || !separation.vocal) throw new Error(`Backing server unreachable after wake retries (${base}/health). Check https://fishes-audio-editor-malt-track.onrender.com/health — Render free tier sleeps, first request takes 60s. Local fallback failed too.`);
           vocal = separation.vocal;
           instrumental = separation.instrumental;
-          meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: 'Server unreachable — used local separation (37% is normal for short clips, record 2+ sec for better)' };
-          // Skip to saving
+          meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: 'Backing server sleeping/unreachable — used local (37%). Wake it: open https://fishes-audio-editor-malt-track.onrender.com/health and retry. Record 2+ sec clear voice for best real backing.' };
           const vocalAsset = await storeAudioData(vocal, `${trackName} vocals`, 'processed');
           const instAsset = await storeAudioData(instrumental, `${trackName} instrumental`, 'processed');
           cacheAudioData(vocalAsset.id, vocal);
@@ -428,7 +452,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             warning: meta.warning,
             error: undefined,
           });
-          store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence)`);
+          store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence) — backing was local, wake server for real backing`);
           return;
         }
         if (!response.ok) {
