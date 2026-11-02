@@ -284,6 +284,8 @@ export function useProjectStore(options: UseProjectOptions = {}) {
         id: makeId('clip'),
         effects: c.effects.map((e) => ({ ...e, params: { ...e.params } })),
       }));
+      // Duplicate should NOT share vocal separation - needs real separation for new track (fixes "duplicate duplicate issue I want real")
+      copy.vocal = { ...copy.vocal, status: 'not-run', vocalAssetId: undefined, instrumentalAssetId: undefined, separatedFromAssetId: undefined, quality: 0, qualityMessage: 'Duplicated track — run separation again for real stems.', error: undefined, warning: undefined };
       p.tracks.splice(index + 1, 0, copy);
       return p;
     });
@@ -374,6 +376,10 @@ export function useProjectStore(options: UseProjectOptions = {}) {
       clipId = clip.id;
       track.clips.push(clip);
       p.media.push({ assetId: asset.id, name, mime: asset.mime, size: asset.size, kind: opts.recording ? 'recording' : 'audio', createdAt: Date.now() });
+      // Adding a new real recording invalidates old vocal separation - need fresh separation for new 1:07 clip
+      if (track.clips.length > 1) {
+        track.vocal = { ...track.vocal, status: 'not-run', vocalAssetId: undefined, instrumentalAssetId: undefined, separatedFromAssetId: undefined, quality: 0, qualityMessage: 'New recording added — run separation again for this track.', error: undefined, warning: undefined };
+      }
       if (opts.recording) {
         // The take id doubles as the clip id so takes can be deleted cleanly.
         const take: RecordingTake = {

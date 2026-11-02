@@ -351,16 +351,27 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
   const handleSeparate = useCallback(async () => {
     if (!selectedTrack || !selectedTrack.clips.length) { setError('Select a track with audio to separate'); return; }
     setError('');
-    // Pre-validate - for very short clips (042 = 0.42s) skip server and use local directly
+    // Choose the clip to separate: selected clip if set, otherwise the longest/most recent recording (fixes duplicate issue)
+    let targetClip = selectedTrack.clips[0];
+    if (selectedTrack.clips.length > 1) {
+      const selected = selectedTrack.clips.find(c => c.id === store.project.selectedClipId);
+      if (selected) targetClip = selected;
+      else {
+        // Pick the longest clip (usually the real 1:07 recording, not the 042 duplicate)
+        targetClip = [...selectedTrack.clips].sort((a, b) => b.duration - a.duration)[0];
+      }
+    }
+    // Pre-validate - for very short clips skip server and use local directly
     let shouldUseLocalOnly = false;
+    let checkedDur = 0;
     try {
-      const checkData = await loadAudioData(selectedTrack.clips[0].assetId);
-      const dur = checkData.length / checkData.sampleRate;
+      const checkData = await loadAudioData(targetClip.assetId);
+      checkedDur = checkData.length / checkData.sampleRate;
       const hasAudio = checkData.channels.some(ch => ch.some(v => Math.abs(v) > 0.008));
-      if (dur < 1.0) {
+      if (checkedDur < 1.0) {
         // Don't call server for <1s - it will 500. Go straight to local.
         shouldUseLocalOnly = true;
-        console.log(`Short clip ${dur.toFixed(2)}s - using local separation only`);
+        console.log(`Short clip ${checkedDur.toFixed(2)}s - using local separation only`);
       } else if (!hasAudio) {
         throw new Error('No audio detected in this clip (silence) — please record again with microphone enabled and speak clearly near the mic.');
       }
@@ -373,7 +384,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       // For other errors, continue - will try separation anyway
     }
     store.setVocalState(selectedTrack.id, { status: 'processing', error: undefined, warning: undefined });
-    const clip = selectedTrack.clips[0];
+    const clip = targetClip;
     const trackId = selectedTrack.id;
     const trackName = selectedTrack.name;
     try {
@@ -431,7 +442,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
             if (!separation || !separation.vocal) throw new Error(`Server: ${text} — and local fallback also failed`);
             vocal = separation.vocal;
             instrumental = separation.instrumental;
-            meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: 'Used local separation — for best server quality, record 1-2s+ of clear voice (your 042 clip was very short)' };
+            meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: `Used local separation for ${checkedDur.toFixed(1)}s clip — server is for 1-2s+ clear voice. Your 1:07 real recording will use server next time.` };
           } else {
             throw new Error(`Separation server error: ${response.status} ${text}`);
           }
