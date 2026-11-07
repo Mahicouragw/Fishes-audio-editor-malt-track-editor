@@ -361,20 +361,16 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         targetClip = [...selectedTrack.clips].sort((a, b) => b.duration - a.duration)[0];
       }
     }
-    // Pre-validate - for very short clips skip server and use local directly
-    let shouldUseLocalOnly = false;
+    // Pre-validate — server now pads <1s to 1.2s, so we ALWAYS try real server (no local shortcut)
     let checkedDur = 0;
     try {
       const checkData = await loadAudioData(targetClip.assetId);
       checkedDur = checkData.length / checkData.sampleRate;
       const hasAudio = checkData.channels.some(ch => ch.some(v => Math.abs(v) > 0.008));
-      if (checkedDur < 1.0) {
-        // Don't call server for <1s - it will 500. Go straight to local.
-        shouldUseLocalOnly = true;
-        console.log(`Short clip ${checkedDur.toFixed(2)}s - using local separation only`);
-      } else if (!hasAudio) {
+      if (!hasAudio) {
         throw new Error('No audio detected in this clip (silence) — please record again with microphone enabled and speak clearly near the mic.');
       }
+      console.log(`Clip ${checkedDur.toFixed(2)}s — will use REAL server`);
     } catch (e) {
       if ((e as Error).message.includes('No audio')) {
         store.setVocalState(selectedTrack.id, { status: 'failed', error: (e as Error).message });
@@ -405,8 +401,8 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         }
         return false;
       };
-      // Short clips: skip server entirely to avoid 500 "too short" error
-      if (apiUrl && !shouldUseLocalOnly) {
+      // REAL HUMAN: always try server when URL exists (server pads short clips, preserves human voice)
+      if (apiUrl) {
         const base = apiUrl.replace(/\/$/, '');
         // Ask to upload to server BEFORE processing - user clicks OK to use real server
         const serverOk = window.confirm(
@@ -419,30 +415,8 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
           `${base}/health`
         );
         if (!serverOk) {
-          // User chose local - use local directly
-          const data = await loadAudioData(clip.assetId);
-          const outcome = await dsp.run({ kind: 'separate', data });
-          const separation = (outcome.result ?? outcome.data) as SeparationResult | undefined;
-          if (!separation || !separation.vocal) throw new Error('Local separation produced no stems');
-          vocal = separation.vocal;
-          instrumental = separation.instrumental;
-          meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: `You chose local for ${checkedDur.toFixed(1)}s clip — for real server backing, run again and click OK to upload to ${base}` };
-          const vocalAsset = await storeAudioData(vocal, `${trackName} vocals`, 'processed');
-          const instAsset = await storeAudioData(instrumental, `${trackName} instrumental`, 'processed');
-          cacheAudioData(vocalAsset.id, vocal);
-          cacheAudioData(instAsset.id, instrumental);
-          store.setVocalState(trackId, {
-            status: 'ready',
-            method: meta.method,
-            vocalAssetId: vocalAsset.id,
-            instrumentalAssetId: instAsset.id,
-            separatedFromAssetId: clip.assetId,
-            quality: meta.quality,
-            qualityMessage: meta.message,
-            warning: meta.warning,
-            error: undefined,
-          });
-          store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence) — local as requested`);
+          store.setVocalState(trackId, { status: 'not-run', error: undefined, warning: `Cancelled — no separation run. Click Run again and OK to use REAL server.` });
+          setError('Cancelled: you must click OK to use the real Demucs server. Local is disabled for real-human mode.');
           return;
         }
         // User clicked OK - upload to real server with wake retry
@@ -467,32 +441,8 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
           }
         }
         if (!response) {
-          console.warn('Server unreachable after retry, using local:', lastErr);
-          // Only fallback to local after wake retries — prevents chipmunk from premature local
-          const localData = await loadAudioData(clip.assetId);
-          const outcome = await dsp.run({ kind: 'separate', data: localData });
-          const separation = (outcome.result ?? outcome.data) as SeparationResult | undefined;
-          if (!separation || !separation.vocal) throw new Error(`Backing server unreachable after wake retries (${base}/health). Check https://fishes-audio-editor-malt-track.onrender.com/health — Render free tier sleeps, first request takes 60s. Local fallback failed too.`);
-          vocal = separation.vocal;
-          instrumental = separation.instrumental;
-          meta = { quality: separation.quality, method: 'local-approximate', message: separation.message, warning: 'Backing server sleeping/unreachable — used local (37%). Wake it: open https://fishes-audio-editor-malt-track.onrender.com/health and retry. Record 2+ sec clear voice for best real backing.' };
-          const vocalAsset = await storeAudioData(vocal, `${trackName} vocals`, 'processed');
-          const instAsset = await storeAudioData(instrumental, `${trackName} instrumental`, 'processed');
-          cacheAudioData(vocalAsset.id, vocal);
-          cacheAudioData(instAsset.id, instrumental);
-          store.setVocalState(trackId, {
-            status: 'ready',
-            method: meta.method,
-            vocalAssetId: vocalAsset.id,
-            instrumentalAssetId: instAsset.id,
-            separatedFromAssetId: clip.assetId,
-            quality: meta.quality,
-            qualityMessage: meta.message,
-            warning: meta.warning,
-            error: undefined,
-          });
-          store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence) — backing was local, wake server for real backing`);
-          return;
+          console.warn('Server unreachable after retry:', lastErr);
+          throw new Error(`Demucs server unreachable after wake retries (${base}/health). Check https://fishes-audio-editor-malt-track.onrender.com/health — Render free tier sleeps, first request takes 60s. Not falling back to local: you requested REAL server only. Fix: open health link, wait until {\"status\":\"ok\"}, then retry OK.`);
         }
         if (!response.ok) {
           const text = await response.text();
@@ -550,6 +500,7 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
       const instAsset = await storeAudioData(instrumental, `${trackName} instrumental`, 'processed');
       cacheAudioData(vocalAsset.id, vocal);
       cacheAudioData(instAsset.id, instrumental);
+      // Real human: when Demucs server succeeds, auto-enable preserve so pitch sounds human not chipmunk
       store.setVocalState(trackId, {
         status: 'ready',
         method: meta.method,
@@ -560,8 +511,9 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         qualityMessage: meta.message,
         warning: meta.warning,
         error: undefined,
+        ...(meta.method === 'demucs-server' ? { enabled: true, preserveTempo: true } : {}),
       });
-      store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence)`);
+      store.announce(`Vocal separation ready (${Math.round(meta.quality * 100)}% confidence) — real human preserved`);
     } catch (e) {
       store.setVocalState(trackId, { status: 'failed', error: (e as Error).message });
       setError((e as Error).message);
