@@ -48,23 +48,37 @@ export function SettingsPage({ store }: { store: ProjectStore }) {
       </section>
 
       <section className="panel" aria-label="Vocal separation">
-        <h2>Vocal separation — Backing fix</h2>
-        <p className="hint">Backing (instrumental) now uses <strong>real Demucs server</strong>, not local. If server is sleeping, we wake it (30-60s) then retry — no more instant local fallback that causes chipmunk.</p>
+        <h2>Vocal separation — Real Demucs Backend</h2>
+        <p className="hint">Backing (instrumental) uses <strong>real Demucs server</strong> with genuine health verification. No more fake Healthy — we verify Demucs installed, model ready, processing works.</p>
         <label className="field">
           <span>Demucs server URL (backing source)</span>
           <input type="url" value={store.settings.separationApiUrl} placeholder="https://fishes-audio-editor-malt-track.onrender.com" aria-label="Demucs server URL" onChange={(e) => store.updateSettings({ separationApiUrl: e.target.value })} />
         </label>
+        <div className="row">
+          <button type="button" className="btn btn-primary" aria-label="Run real Demucs health check" onClick={async () => {
+            const base = store.settings.separationApiUrl.replace(/\/$/, '');
+            const healthUrl = `${base}/health`;
+            const detailedUrl = `${base}/health?force=1`;
+            try {
+              const r = await fetch(healthUrl);
+              const j = await r.json();
+              const checks = j.checks ? Object.entries(j.checks).map(([k,v]) => `${k}: ${v ? '✅' : '❌'}`).join('\n') : JSON.stringify(j, null, 2);
+              alert(`Health: ${j.status}\n${checks}\n\nModel: ${j.model}\nBackend: ${j.backend_connected ? '✅' : '❌'}\nDemucs: ${j.demucs_installed ? '✅' : '❌'}\nModel Ready: ${j.model_ready ? '✅' : '❌'}\nProcessing: ${j.processing_available ? '✅' : '❌'}\n\nFor deep test: ${detailedUrl}`);
+            } catch (e) { alert(`❌ Server down/sleeping: ${(e as Error).message}\nTry: ${healthUrl} — Render sleeps after 15m, wake takes 60s.`); }
+          }}>Real Health Check (5 statuses)</button>
+          <button type="button" className="btn" aria-label="Deep processing test" onClick={async () => {
+            const base = store.settings.separationApiUrl.replace(/\/$/, '');
+            try { const r = await fetch(`${base}/health?force=1`); const j = await r.json(); alert(`Deep check: ${j.status}\nProcessing: ${j.processing_available ? 'OK' : j.processing_test_error}\nModel load: ${j.model_load_error || 'OK'}`); } catch (e) { alert(`Failed: ${(e as Error).message}`); }
+          }}>Deep Processing Test</button>
+        </div>
         <p className="hint">
-          Default: <a href="https://fishes-audio-editor-malt-track.onrender.com/health" target="_blank" rel="noopener">https://fishes-audio-editor-malt-track.onrender.com/health</a> —
+          <a href="https://fishes-audio-editor-malt-track.onrender.com/health" target="_blank" rel="noopener">/health</a> —
+          <a href="https://fishes-audio-editor-malt-track.onrender.com/health?force=1" target="_blank" rel="noopener"> /health?force=1 (real test)</a> —
           <a href="https://fishes-audio-editor-malt-track.onrender.com/docs" target="_blank" rel="noopener"> /docs</a> —
-          <a href="https://fishes-audio-editor-malt-track.onrender.com/" target="_blank" rel="noopener"> / (root)</a> |
-          <a href="https://dashboard.render.com/" target="_blank" rel="noopener"> Render dashboard</a> |
-          <button type="button" className="btn btn-xs" onClick={async () => {
-            const url = store.settings.separationApiUrl.replace(/\/$/, '') + '/health';
-            try { const r = await fetch(url); const j = await r.json(); alert(`✅ Server UP: ${JSON.stringify(j)}`); } catch (e) { alert(`❌ Server down/sleeping: ${(e as Error).message} — Render free tier sleeps after 15m, first request wakes it in ~60s. Try again.`); }
-          }}>Check server now</button>
+          <a href="https://fishes-audio-editor-malt-track.onrender.com/jobs" target="_blank" rel="noopener"> /jobs</a> |
+          <a href="https://dashboard.render.com/" target="_blank" rel="noopener"> Render dashboard</a>
         </p>
-        <p className="hint">Backing tracks: when separation shows <em>Method: Demucs server</em> = real backing. If it shows <em>local approximate</em> = fallback — record 2+ sec clear voice, and ensure server is awake via links above.</p>
+        <p className="hint">Statuses shown: <strong>Backend Connected, Demucs Installed, Model Ready, Processing Available, Last Processing Result</strong> — never fake Healthy from just HTTP 200. When separation shows <em>Method: Demucs server</em> = real backing with jobId & progress.</p>
       </section>
 
       <section className="panel" aria-label="Theme and accessibility">

@@ -1,0 +1,26 @@
+.instrument-studio { display: flex; flex-direction: column; gap: 16px; }
+.category-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.category-card { min-height: 120px; flex-direction: column; font-size: 1.1em; border-width: 2px; }
+.category-card small { color: var(--muted); font-size: 0.85em; }
+.subcategory-grid, .instrument-selector { display: flex; flex-direction: column; gap: 12px; }
+.instrument-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.instrument-card { display: flex; flex-direction: column; align-items: flex-start; text-align: left; padding: 12px; gap: 4px; min-height: 90px; }
+.instrument-card strong { font-size: 1em; }
+.instrument-card .licensed { color: var(--success); font-size: 0.75em; }
+.instrument-playground { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+.octave-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.piano-keyboard { position: relative; background: #111; border-radius: 12px; padding: 12px; overflow-x: auto; }
+.white-keys { display: flex; gap: 2px; position: relative; }
+.white-key { flex: 1; min-width: 44px; height: 160px; background: linear-gradient(#fff, #e8e8e8); border: 1px solid #bbb; border-radius: 0 0 8px 8px; color: #333; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; padding: 8px 4px; min-height: 44px; position: relative; }
+.white-key.active, .white-key[aria-pressed="true"] { background: linear-gradient(#8b5cf6, #7c3aed); color: white; transform: translateY(2px); box-shadow: inset 0 2px 8px rgba(0,0,0,0.3); }
+.black-keys { position: absolute; top: 12px; left: 12px; right: 12px; height: 100px; pointer-events: none; }
+.black-key { position: absolute; width: 28px; height: 100px; background: linear-gradient(#222, #000); border: 1px solid #000; border-radius: 0 0 6px 6px; color: white; display: flex; justify-content: center; padding-top: 8px; pointer-events: auto; }
+.black-key.active, .black-key[aria-pressed="true"] { background: linear-gradient(var(--accent), var(--accent-strong)); }
+.key-label { font-size: 0.7em; font-weight: 600; }
+.keyboard-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.transport { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; background: var(--bg-panel); padding: 12px; border-radius: 10px; border: 1px solid var(--border); }
+.recording { animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+.recording-workflow ol { margin: 8px 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.project-tracks-preview ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.project-tracks-preview li { padding: 6px 10px; background: var(--bg-panel); border-radius: 8px; border: 1px solid var(--border); font-size: 0.9em; }
