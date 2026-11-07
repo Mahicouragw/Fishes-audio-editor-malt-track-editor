@@ -4,7 +4,7 @@ import type { ProjectStore } from '../store/projectStore';
 import type { StudioTab } from './StudioPage';
 import { decodeAudioFile, extractAudioFromVideo, validateMediaFile } from '../audio/decode';
 
-export function HomePage({ store, onOpenStudio }: { store: ProjectStore; onOpenStudio: (tab?: StudioTab) => void }) {
+export function HomePage({ store, onOpenStudio, onOpenInstruments }: { store: ProjectStore; onOpenStudio: (tab?: StudioTab) => void; onOpenInstruments?: () => void }) {
   const [busy, setBusy] = useState('');
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState('');
@@ -157,6 +157,13 @@ export function HomePage({ store, onOpenStudio }: { store: ProjectStore; onOpenS
         </section>
 
         <section className="home-card">
+        <section className="home-card" style={{ borderColor: 'var(--accent)', borderWidth: 2 }}>
+          <h2>🎹 Create Instrument Track</h2>
+          <p>Real sampled instruments — Grand Piano, Guitar, Bass, Drums. Play keyboard while hearing vocals/background, record as separate track. Authentic samples (Salamander CC BY 3.0, VSCO2).</p>
+          <button type="button" className="btn btn-primary" aria-label="Create Instrument Track, open real instrument studio" onClick={() => onOpenInstruments?.()}>Create Instrument Track</button>
+          <p className="hint">Instruments → Keyboard → Grand Piano → Play while background plays → Record → Saved as separate track, all tracks play together.</p>
+        </section>
+
           <h2><Clock size={20} aria-hidden="true" /> Recent Projects</h2>
           {recents.length ? (
             <ul className="region-list" aria-label="Recent projects">

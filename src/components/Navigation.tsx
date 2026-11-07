@@ -1,10 +1,11 @@
-import { Music2, Library, Settings, Home } from 'lucide-react';
+import { Music2, Library, Settings, Home, Piano } from 'lucide-react';
 import type { View } from '../App';
 
 export function Navigation({ view, onView, title }: { view: View; onView: (v: View) => void; title: string }) {
   const items: Array<{ id: View; label: string; icon: typeof Home }> = [
     { id: 'home', label: 'Home', icon: Home },
     { id: 'studio', label: 'Studio', icon: Music2 },
+    { id: 'instruments', label: 'Instruments', icon: Piano },
     { id: 'library', label: 'Library', icon: Library },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];

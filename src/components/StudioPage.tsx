@@ -37,7 +37,7 @@ function clipKey(track: Track, clip: Clip): string {
   return [clip.assetId, effectivePitchSemis(track), vocalKey, clip.fadeIn, clip.fadeOut, JSON.stringify(clip.effects), clip.sourceStart].join('|');
 }
 
-export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectStore; initialTab?: StudioTab }) {
+export function StudioPage({ store, initialTab = 'effects', onOpenInstruments }: { store: ProjectStore; initialTab?: StudioTab; onOpenInstruments?: () => void }) {
   const [position, setPosition] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [paused, setPaused] = useState(false);
@@ -704,6 +704,10 @@ export function StudioPage({ store, initialTab = 'effects' }: { store: ProjectSt
         </div>
 
         <aside className="studio-side" aria-label="Editing panels">
+          <div className="panel" style={{ borderColor: 'var(--accent)', borderWidth: 2 }}>
+            <button type="button" className="btn btn-primary" aria-label="Create Instrument Track — open real instrument studio" onClick={() => onOpenInstruments?.()}>🎹 Create Instrument Track</button>
+            <p className="hint">Real sampled Grand Piano, Guitar, Bass, Drums — play while hearing existing tracks, record as separate synchronized track.</p>
+          </div>
           <div className="tabs" role="tablist" aria-label="Studio panels">
             {(['effects', 'record', 'silence', 'merge'] as const).map((tab) => (
               <button key={tab} type="button" role="tab" aria-selected={activeTab === tab} className={`tab ${activeTab === tab ? 'active' : ''}`} onClick={() => setActiveTab(tab)}>{tab}</button>
